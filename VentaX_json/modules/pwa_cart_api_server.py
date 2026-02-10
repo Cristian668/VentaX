@@ -998,11 +998,11 @@ class PWACartAPIServer:
         
         @self.app.route('/pwa_cart/')
         def pwa_home():
-            """PWA主页"""
-            from flask import send_from_directory
-            if not self.app or not self.app.static_folder:
-                from flask import abort
-                abort(500)
+            """PWA主页；云端部署无前端文件时重定向到 Pages"""
+            from flask import send_from_directory, redirect
+            index_path = os.path.join(self.app.static_folder, 'index.html') if (self.app and self.app.static_folder) else ''
+            if not self.app or not self.app.static_folder or not (os.path.exists(index_path) and os.path.isfile(index_path)):
+                return redirect(os.getenv('PAGES_IMAGE_BASE_URL', 'https://ventax.pages.dev/pwa_cart').rstrip('/') + '/', code=302)
             return send_from_directory(self.app.static_folder, 'index.html')
         
         @self.app.route('/favicon.ico')
@@ -1025,9 +1025,8 @@ class PWACartAPIServer:
             logger.info(f"🖼️ PNG图标请求: icon-{size}.png, 返回SVG版本")
             
             if not self.app or not self.app.static_folder:
-                from flask import abort
-                abort(500)
-            
+                from flask import redirect
+                return redirect(os.getenv('PAGES_IMAGE_BASE_URL', 'https://ventax.pages.dev/pwa_cart').rstrip('/') + '/', code=302)
             # 确定对应的SVG文件名
             if size == 192:
                 svg_filename = 'icon-192.svg'
@@ -1068,8 +1067,8 @@ class PWACartAPIServer:
             import os
             logger.debug(f"📁 PWA静态文件请求: {filename}, static_folder: {self.app.static_folder if self.app else 'N/A'}")
             if not self.app or not self.app.static_folder:
-                logger.error("❌ PWA静态文件: app或static_folder未设置")
-                abort(500)
+                from flask import redirect
+                return redirect(os.getenv('PAGES_IMAGE_BASE_URL', 'https://ventax.pages.dev/pwa_cart').rstrip('/') + '/', code=302)
             file_path = os.path.join(self.app.static_folder, filename)
             logger.debug(f"📁 文件路径: {file_path}, 存在: {os.path.exists(file_path)}")
             if os.path.exists(file_path) and os.path.isfile(file_path):
