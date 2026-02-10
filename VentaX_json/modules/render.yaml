@@ -1,0 +1,27 @@
+# Render 部署配置 - 方案 A 后端
+# 文档: https://render.com/docs/blueprint-spec
+# 使用方式: Render Dashboard -> New -> Blueprint -> 连 Git 后选此文件
+
+services:
+  - type: web
+    name: pwa-cart-api
+    runtime: python
+    region: oregon
+    plan: free
+    buildCommand: pip install -r requirements_pwa_render.txt
+    startCommand: gunicorn --bind 0.0.0.0:$PORT --workers 1 --threads 4 pwa_cart_api_server:app
+    envVars:
+      - key: PYTHON_VERSION
+        value: 3.11.0
+      - key: DATABASE_URL
+        sync: false
+        # 从 Neon 获取，格式: postgresql://user:pass@host/db?sslmode=require
+      - key: R2_IMAGE_BASE_URL
+        sync: false
+        # R2 公网访问 base，如 https://xxx.r2.dev/cristy 或自定义域名
+      - key: PAGES_IMAGE_BASE_URL
+        sync: false
+        # 用 Cloudflare Pages 存图时填，如 https://ventax.pages.dev/pwa_cart，API 会返回该 base + Ya%20Subio/Cristy/xxx.jpg
+      - key: JWT_SECRET_KEY
+        generateValue: true
+        # 自动生成，用于 token 签名
