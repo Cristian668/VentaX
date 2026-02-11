@@ -2,14 +2,19 @@
 <html lang="es">
 <head>
     <meta charset="UTF-8">
-    <!-- CHANGE: 使用应用所在目录作为 base，部署在 ventax.pages.dev/pwa_cart/ 时加载 /pwa_cart/styles.css 避免 404 -->
+    <!-- CHANGE: 最先设置 base，使所有相对路径(styles.css/icon/manifest)在 /pwa_cart/ 下解析到正确位置，避免 404 -->
     <script>
       (function(){
         var path = (location.pathname || '');
-        var base = (path.indexOf('/pwa_cart') !== -1) ? '/pwa_cart' : '';
+        if (path.indexOf('/pwa_cart') !== -1) {
+          var base = document.createElement('base');
+          base.href = location.origin + '/pwa_cart/';
+          document.head.insertBefore(base, document.head.firstChild);
+        }
+        var basePath = (path.indexOf('/pwa_cart') !== -1) ? '/pwa_cart' : '';
         var link = document.createElement('link');
         link.rel = 'stylesheet';
-        link.href = location.origin + base + '/styles.css?v=9';
+        link.href = location.origin + basePath + '/styles.css?v=9';
         document.head.appendChild(link);
       })();
     </script>
