@@ -468,9 +468,17 @@ class PWACartAPIServer:
 
     def _get_pg_config(self) -> Optional[Dict[str, Any]]:
         """从 database_config.json 或 DATABASE_URL 环境变量读取 PostgreSQL 配置（ULTIMO 产品数据源）。
-        CHANGE: 方案 A 云端部署时优先用 DATABASE_URL（Neon 等托管 PG 提供）。"""
+        CHANGE: 方案 A 云端部署时优先用 DATABASE_URL（Neon 等托管 PG 提供）。
+        CHANGE: 若从 Neon Console 复制了 psql 命令行格式（psql 'postgresql://...'），自动剥掉外层只取 URI。"""
         db_url = os.getenv('DATABASE_URL', '').strip()
         if db_url:
+            # Neon Console 复制的是 psql 'postgresql://...' 或 psql "postgresql://..."，psycopg2 需要纯 URI
+            if db_url.lower().startswith("psql '") and db_url.endswith("'"):
+                db_url = db_url[6:-1].strip()  # 去掉 psql ' 和末尾 '
+            elif db_url.lower().startswith('psql "') and db_url.endswith('"'):
+                db_url = db_url[6:-1].strip()  # 去掉 psql " 和末尾 "
+            elif db_url.lower().startswith("psql "):
+                db_url = db_url[4:].strip().strip("'\"").strip()
             return {'_connection_string': db_url}
         cfg_path = os.path.join(current_dir, '..', 'database_config.json')
         try:
