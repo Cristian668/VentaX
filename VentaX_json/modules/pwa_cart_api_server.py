@@ -1638,14 +1638,16 @@ class PWACartAPIServer:
         @self.app.route('/api/products', methods=['GET'])
         def get_products():
             """获取产品列表 - 按新到旧排序，只显示激活的产品"""
+            category = request.args.get('category', None)
+            search = request.args.get('search', None)
+            supplier = request.args.get('supplier', None)  # CHANGE: 支持 supplier 参数筛选
+            logger.info(f"📥 [API] 收到 /api/products 请求 supplier={supplier!r}, search={search!r}")
+            print(f"📥 [API] 收到 /api/products 请求 supplier={supplier!r}, search={search!r}")
             try:
                 if not self.db:
                     return jsonify({"error": "数据库未连接"}), 500
                 
                 # 获取查询参数
-                category = request.args.get('category', None)
-                search = request.args.get('search', None)
-                supplier = request.args.get('supplier', None)  # CHANGE: 支持 supplier 参数筛选
                 supplier_lower = (supplier or '').strip().lower()  # 统一小写比较，避免 Others/others 等导致走错分支
                 page = int(request.args.get('page', 1))
                 limit = int(request.args.get('limit', 30))  # 默认返回30个产品
@@ -1655,6 +1657,8 @@ class PWACartAPIServer:
                     products = self.db.get_all_products()
                 else:
                     products = self._get_products_dict_from_postgres()
+                logger.info(f"📦 [API] 已从 PG 加载产品数: {len(products)}")
+                print(f"📦 [API] 已从 PG 加载产品数: {len(products)}")
                 
                 # CHANGE: 自家产品标识 - 使用 codigo_proveedor = 'Cristy'
                 OWN_SUPPLIER_CODE = 'Cristy'
@@ -2153,6 +2157,10 @@ class PWACartAPIServer:
                 filtered_with_image = []
                 for product_id, product_info, created_at in filtered_with_meta:
                     image_path = product_info.get('image_path', '')
+                    # CHANGE: 已是云端 URL（PAGES_IMAGE_BASE_URL/R2）时直接使用，不覆盖为 /api/images/，也不走本地 resolve
+                    if image_path and (image_path.startswith('http://') or image_path.startswith('https://')):
+                        filtered_with_image.append((product_id, product_info, created_at, image_path))
+                        continue
                     if image_path:
                         if image_path.startswith('/api/images/'):
                             fname = image_path.replace('/api/images/', '').split('?')[0].strip()
@@ -2160,9 +2168,9 @@ class PWACartAPIServer:
                         elif '/pwa_cart/static/img/' in image_path or image_path.startswith('/pwa_cart/static/img/'):
                             filename = _normalize_image_filename(os.path.basename(image_path))
                             image_path = f'/api/images/{filename}'
-                    elif image_path.startswith('/img/') or '/img/' in image_path:
-                        filename = _normalize_image_filename(os.path.basename(image_path))
-                        image_path = f'/api/images/{filename}'
+                        elif image_path.startswith('/img/') or '/img/' in image_path:
+                            filename = _normalize_image_filename(os.path.basename(image_path))
+                            image_path = f'/api/images/{filename}'
                     elif os.path.isabs(image_path) or (image_path and ('D:' in image_path or 'C:' in image_path)):
                         normalized_path = image_path.replace('/', os.sep).replace('\\', os.sep)
                         filename = _normalize_image_filename(os.path.basename(normalized_path))
@@ -2257,6 +2265,7 @@ class PWACartAPIServer:
                 
             except Exception as e:
                 logger.error(f"❌ 获取产品列表失败: {e}")
+                print(f"❌ [API] 获取产品列表失败: {e}")
                 return jsonify({"error": str(e)}), 500
         
         @self.app.route('/api/products/<product_id>', methods=['GET'])
@@ -2341,7 +2350,10 @@ class PWACartAPIServer:
                 
                 # CHANGE: 转换图片路径为URL - 处理所有可能的路径格式；统一去掉文件名方括号与 D:\Ya Subio 实际文件名一致
                 image_path = product.get('image_path', '')
-                if image_path:
+                # 已是云端 URL 时直接使用，不再转为 /api/images/
+                if image_path and (image_path.startswith('http://') or image_path.startswith('https://')):
+                    pass  # 保持 image_path 不变，跳过下方本地路径逻辑
+                elif image_path:
                     if image_path.startswith('/api/images/'):
                         fname = image_path.replace('/api/images/', '').split('?')[0].strip()
                         image_path = f'/api/images/{_normalize_image_filename(fname)}'
@@ -2359,9 +2371,9 @@ class PWACartAPIServer:
                         image_path = f'/api/images/{filename}'
                     elif image_path and not image_path.startswith('http'):
                         image_path = f'/api/images/{_normalize_image_filename(image_path)}'
-                # CHANGE: 与列表一致，单一逻辑「根据图片名称查找」+ product_id
+                # CHANGE: 与列表一致，单一逻辑「根据图片名称查找」+ product_id；已是 http(s) 时不走本地目录
                 _ya = PWA_YA_SUBIO_BASE
-                if os.path.isdir(_ya):
+                if not (image_path and (image_path.startswith('http://') or image_path.startswith('https://'))) and os.path.isdir(_ya):
                     try:
                         import re
                         files = []
