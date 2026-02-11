@@ -501,7 +501,9 @@ class PWACartAPIServer:
             ruta = ruta.decode('utf-8', errors='replace').strip()
         if not ruta:
             return ''
-        basename = _normalize_image_filename(os.path.basename(ruta.replace('/', os.path.sep)))
+        # CHANGE: Render 上为 Linux，os.path.basename('D:\Cristy\Procesado\xx.jpg') 会返回整串（无 /）；先统一为 / 再取 basename
+        ruta_norm = ruta.replace('\\', '/')
+        basename = _normalize_image_filename(os.path.basename(ruta_norm))
         if not basename:
             return ''
         # Cloudflare Pages：一键同步上传了 pwa_cart/Ya Subio（含 Cristy），URL 为 base/Ya%20Subio/Cristy/xxx 或 base/Ya%20Subio/xxx
