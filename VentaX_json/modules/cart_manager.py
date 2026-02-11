@@ -9,8 +9,15 @@ VentaX 客户下单Bot - 购物车管理模块
 import os
 import sys
 import logging
-from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
-from telegram.ext import ContextTypes
+
+# CHANGE: telegram 可选，无 telegram 时仅提供 get_user_cart/save_user_cart 等供 PWA API 使用
+try:
+    from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
+    from telegram.ext import ContextTypes
+    TELEGRAM_AVAILABLE = True
+except ImportError:
+    TELEGRAM_AVAILABLE = False
+    Update = InlineKeyboardButton = InlineKeyboardMarkup = ContextTypes = None
 
 # 添加模块路径
 sys.path.append(os.path.dirname(__file__))
@@ -369,6 +376,8 @@ class CartManager:
     
     async def show_cart(self, query, context):
         """显示购物车"""
+        if not TELEGRAM_AVAILABLE:
+            return
         try:
             user_id = query.from_user.id
             cart = self.get_user_cart(user_id)
@@ -425,6 +434,8 @@ class CartManager:
     
     async def start_checkout(self, query, context):
         """开始结账"""
+        if not TELEGRAM_AVAILABLE:
+            return
         try:
             user_id = query.from_user.id
             cart = self.get_user_cart(user_id)
@@ -471,6 +482,8 @@ class CartManager:
     
     async def confirm_order(self, query, context):
         """确认订单"""
+        if not TELEGRAM_AVAILABLE:
+            return
         try:
             user_id = query.from_user.id
             cart = self.get_user_cart(user_id)
