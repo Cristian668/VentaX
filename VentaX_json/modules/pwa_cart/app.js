@@ -34,6 +34,17 @@ function _resolveImageSrc(imagePath) {
     if (!imagePath || typeof imagePath !== 'string') return '';
     var raw = imagePath.trim();
     if (raw.startsWith('http://') || raw.startsWith('https://')) {
+        // 同源且路径含 /pwa_cart/ 时改为从 API /api/images/<文件名> 拉图，避免 Pages 静态文件 404（PRODUCTOS/ULTIMO 图统一走 API）
+        try {
+            var u = new URL(raw);
+            if (typeof window !== 'undefined' && window.location && u.origin === window.location.origin && u.pathname.indexOf('/pwa_cart') !== -1) {
+                var apiOrigin = _getImageBase();
+                if (apiOrigin && apiOrigin !== window.location.origin) {
+                    var fn = u.pathname.replace(/^.*\//, '').trim();
+                    if (fn) return apiOrigin + '/api/images/' + encodeURIComponent(fn);
+                }
+            }
+        } catch (e) { /* ignore */ }
         // 若 URL 里误含 Windows 路径（如 .../Cristy/D%3A%5CCristy%5C...），只保留最后一个文件名再拼回
         var lastSlash = raw.lastIndexOf('/');
         if (lastSlash !== -1) {
@@ -232,6 +243,11 @@ async function apiRequest(endpoint, options = {}) {
 async function fetchProducts(supplier = null) {
     const LOAD_TIMEOUT_MS = 30000;  // ULTIMO(Cristy) 匹配 DB 可能需数秒
     const effectiveSupplier = supplier != null && supplier !== '' ? supplier : 'Cristy';
+    // NOTE: 请求开始时显示加载状态，避免长时间无反馈（如 Render 冷启动）
+    var productsGrid = document.getElementById('productsGrid');
+    if (productsGrid) {
+        productsGrid.innerHTML = '<div class="empty-state" style="grid-column:1/-1;text-align:center;padding:4rem 2rem;color:var(--text-light);">Cargando productos...</div>';
+    }
     try {
         console.log('📦 [fetchProducts] 开始获取产品列表...', `supplier=${effectiveSupplier}`);
         let url = '/products?limit=500';
@@ -244,12 +260,16 @@ async function fetchProducts(supplier = null) {
         });
         const result = await Promise.race([apiRequest(url), timeoutPromise]);
         console.log('📦 [fetchProducts] API响应:', result);
-        
-        if (result && result.success) {
+
+        // CHANGE: 兼容仅返回 result.data 数组的后端（无 result.success）
+        var ok = result && (result.success === true || (Array.isArray(result.data) && result.data.length > 0));
+        if (ok) {
             var newProducts = Array.isArray(result.data) ? result.data.slice() : [];
             console.log('✅ [fetchProducts] 成功加载 ' + newProducts.length + ' 个产品 supplier=' + effectiveSupplier);
             // CHANGE: 仅当当前视图与本次请求一致时才更新列表，避免 others 晚返回覆盖 ULTIMO 的 Cristy 列表
             var viewMatch = (effectiveSupplier === 'Cristy' && AppState.currentView === 'ultimo') || (effectiveSupplier === 'others' && AppState.currentView === 'products');
+            // NOTE: 首次加载（产品为空）且是 Cristy 数据时，无论 viewMatch 都更新，避免竞态导致列表一直空
+            var isFirstLoadCristy = effectiveSupplier === 'Cristy' && newProducts.length > 0 && AppState.products.length === 0;
             if (AppState._hashProductForView && effectiveSupplier === 'others' && AppState.currentView === 'products') {
                 var hp = AppState._hashProductForView.product;
                 if (hp && !newProducts.some(function(px) { return String(px.id) === String(hp.id); })) {
@@ -261,7 +281,7 @@ async function fetchProducts(supplier = null) {
                 requestAnimationFrame(function() {
                     requestAnimationFrame(function() { applyProductHashAnchor(); });
                 });
-            } else if (viewMatch) {
+            } else if (viewMatch || isFirstLoadCristy) {
                 AppState.products = newProducts;
                 if (AppState.products.length === 0) {
                     console.warn('⚠️ [fetchProducts] 警告: API返回成功，但产品列表为空');

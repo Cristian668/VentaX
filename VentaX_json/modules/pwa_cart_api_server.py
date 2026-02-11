@@ -314,11 +314,15 @@ class PWACartAPIServer:
             # 设置静态文件目录
             static_folder = os.path.join(os.path.dirname(__file__), 'pwa_cart')
             self.app = Flask(__name__, static_folder=static_folder, static_url_path='/pwa_cart')
-            # CHANGE: 明确允许云端页 ventax.pages.dev 与本机，避免部署到 Render 后 CORS 拦截
-            CORS(self.app, origins=[
+            # CHANGE: 明确允许云端页 ventax.pages.dev、预览部署 *.ventax.pages.dev 与本机，避免 CORS 拦截
+            _cors_origins = [
                 "https://ventax.pages.dev", "http://localhost:5000", "http://127.0.0.1:5000",
                 "http://localhost", "http://127.0.0.1"
-            ], supports_credentials=True)
+            ]
+            _extra = (os.getenv('CORS_EXTRA_ORIGINS') or '').strip().split(',')
+            _cors_origins.extend([o.strip() for o in _extra if o.strip()])
+            _cors_origins.append("https://df6334cd.ventax.pages.dev")  # Wrangler 预览部署
+            CORS(self.app, origins=_cors_origins, supports_credentials=True)
             
             # CHANGE: /pwa_cart/api/* 重写为 /api/*，便于前端在 /pwa_cart/ 页时统一用 /pwa_cart/api 避免 404（如反向代理只转发 /pwa_cart 时）
             @self.app.before_request
