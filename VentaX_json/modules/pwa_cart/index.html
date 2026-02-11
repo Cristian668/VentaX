@@ -1,0 +1,388 @@
+<!DOCTYPE html>
+<html lang="es">
+<head>
+    <meta charset="UTF-8">
+    <!-- CHANGE: 使用应用所在目录作为 base，部署在 ventax.pages.dev/pwa_cart/ 时加载 /pwa_cart/styles.css 避免 404 -->
+    <script>
+      (function(){
+        var path = (location.pathname || '');
+        var base = (path.indexOf('/pwa_cart') !== -1) ? '/pwa_cart' : '';
+        var link = document.createElement('link');
+        link.rel = 'stylesheet';
+        link.href = location.origin + base + '/styles.css?v=9';
+        document.head.appendChild(link);
+      })();
+    </script>
+    <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
+    <meta name="description" content="VentaX Carrito - Aplicación PWA">
+    <meta name="theme-color" content="#4CAF50">
+    <!-- Permissions Policy -->
+    <!-- 移除 unload=* 以避免权限策略违规 -->
+    <title>VentaX Carrito</title>
+    
+    <!-- Favicon / Manifest：应用目录相对路径，部署在 /pwa_cart/ 时正确加载 -->
+    <link rel="icon" type="image/svg+xml" href="icon-192.svg">
+    <link rel="manifest" href="manifest.json">
+    
+    <!-- Google Fonts - 现代字体 -->
+    <link rel="preconnect" href="https://fonts.googleapis.com">
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+    <link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700;800&family=Poppins:wght@400;500;600;700;800&display=swap" rel="stylesheet">
+    
+    <!-- iOS PWA支持 -->
+    <!-- 使用新的标准，移除已弃用的 apple-mobile-web-app-capable -->
+    <meta name="mobile-web-app-capable" content="yes">
+    <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
+    <meta name="apple-mobile-web-app-title" content="VentaX Carrito">
+    
+    <!-- 样式已由顶部脚本注入；此处备用使用相对路径 -->
+    <link rel="stylesheet" href="styles.css?v=9">
+    <!-- Lucide Icons CDN - 新一代图标库 (jsdelivr 备选) -->
+    <script src="https://cdn.jsdelivr.net/npm/lucide@0.460.0/dist/umd/lucide.min.js"></script>
+</head>
+<body>
+    <!-- 背景装饰元素 -->
+    <div class="bg-decoration">
+        <div class="decoration-circle circle-1"></div>
+        <div class="decoration-circle circle-2"></div>
+        <div class="decoration-circle circle-3"></div>
+    </div>
+    <!-- 顶部导航栏 -->
+    <header class="header">
+        <div class="header-content">
+            <h1 class="logo"><i data-lucide="shopping-bag" class="logo-icon"></i> VentaX</h1>
+            <div class="header-actions">
+                <!-- CHANGE: 用户信息显示 -->
+                <div class="user-info hidden" id="userInfo">
+                    <img id="userAvatar" src="" alt="Avatar" class="user-avatar">
+                    <span id="userName" class="user-name"></span>
+                    <button class="logout-btn" id="logoutBtn" title="Cerrar sesión"><i data-lucide="log-out"></i></button>
+                </div>
+                <button class="login-btn hidden" id="loginBtn">Iniciar Sesión</button>
+                <button class="cart-button" id="cartButton">
+                    <span class="cart-icon"><i data-lucide="shopping-cart"></i></span>
+                    <span class="cart-count" id="cartCount">0</span>
+                </button>
+            </div>
+        </div>
+    </header>
+
+    <!-- 主要内容区域 -->
+    <main class="main-content">
+        <!-- 产品列表视图 -->
+        <section class="products-section" id="productsSection">
+            <div class="section-header">
+                <h2>Catálogo de Productos</h2>
+                <div class="search-bar">
+                    <span class="search-icon-wrap"><i data-lucide="search"></i></span>
+                    <input type="text" id="searchInput" placeholder="Buscar productos..." class="search-input">
+                </div>
+            </div>
+            <div class="products-grid" id="productsGrid">
+                <!-- 产品卡片将动态加载 -->
+                <div class="loading">Cargando productos...</div>
+            </div>
+        </section>
+
+        <!-- 购物车视图 -->
+        <section class="cart-section hidden" id="cartSection">
+            <div class="section-header">
+                <h2>Mi Carrito</h2>
+                <div style="display: flex; gap: 0.5rem; align-items: center;">
+                    <button class="btn btn-secondary" id="editCustomerInfoButton" style="font-size: 0.9rem; padding: 0.5rem 1rem;">
+                        <i data-lucide="pencil" class="btn-icon"></i> Editar Datos
+                    </button>
+                    <button class="back-button" id="backButton">← Volver</button>
+                </div>
+            </div>
+            <div class="cart-items" id="cartItems">
+                <!-- 购物车商品将动态加载 -->
+            </div>
+            <div class="cart-footer">
+                <div class="cart-summary">
+                    <div class="summary-row">
+                        <span>Subtotal:</span>
+                        <span id="subtotal">$0.00</span>
+                    </div>
+                    <div class="summary-row">
+                        <span>Envío:</span>
+                        <span id="shipping">$8.00</span>
+                    </div>
+                    <div class="summary-row total">
+                        <span>Total:</span>
+                        <span id="total">$8.00</span>
+                    </div>
+                </div>
+                <div class="cart-actions">
+                    <button class="btn btn-secondary" id="clearCartButton">Vaciar Carrito</button>
+                    <button class="btn btn-primary" id="checkoutButton">Realizar Pedido</button>
+                </div>
+            </div>
+        </section>
+
+        <!-- 订单列表视图 -->
+        <section class="orders-section hidden" id="ordersSection">
+            <div class="section-header">
+                <h2>Mis Pedidos</h2>
+                <div style="display: flex; gap: 0.5rem; align-items: center;">
+                    <button class="btn btn-secondary" id="editCustomerInfoButtonOrders" style="font-size: 0.9rem; padding: 0.5rem 1rem;">
+                        <i data-lucide="pencil" class="btn-icon"></i> Editar Datos
+                    </button>
+                    <button class="back-button" id="ordersBackButton">← Volver</button>
+                </div>
+            </div>
+            <div class="orders-list" id="ordersList">
+                <!-- 订单列表将动态加载 -->
+                <div class="loading">Cargando pedidos...</div>
+            </div>
+        </section>
+
+        <!-- 订单详情视图 -->
+        <section class="order-detail-section hidden" id="orderDetailSection">
+            <div class="section-header">
+                <h2>Detalle del Pedido</h2>
+                <button class="back-button" id="orderDetailBackButton">← Volver</button>
+            </div>
+            <div class="order-detail-content" id="orderDetailContent">
+                <!-- 订单详情将动态加载 -->
+            </div>
+        </section>
+
+        <!-- 转账信息视图 -->
+        <section class="payment-section hidden" id="paymentSection">
+            <div class="section-header">
+                <h2>Información de Transferencia</h2>
+                <div style="display: flex; gap: 0.5rem; align-items: center;">
+                    <button class="btn btn-secondary" id="editCustomerInfoButtonPayment" style="font-size: 0.9rem; padding: 0.5rem 1rem;">
+                        <i data-lucide="pencil" class="btn-icon"></i> Editar Datos
+                    </button>
+                    <button class="back-button" id="paymentBackButton">← Volver</button>
+                </div>
+            </div>
+            <div class="payment-content" id="paymentContent">
+                <!-- 转账信息将动态加载 -->
+            </div>
+        </section>
+    </main>
+
+    <!-- 底部导航栏 -->
+    <nav class="bottom-nav">
+        <button class="nav-item active" data-view="ultimo">
+            <span class="nav-icon"><i data-lucide="sparkles"></i></span>
+            <span class="nav-label">Ultimo</span>
+        </button>
+        <button class="nav-item" data-view="products">
+            <span class="nav-icon"><i data-lucide="package"></i></span>
+            <span class="nav-label">Productos</span>
+        </button>
+        <button class="nav-item" data-view="cart">
+            <span class="nav-icon"><i data-lucide="shopping-cart"></i></span>
+            <span class="nav-label">Carrito</span>
+            <span class="nav-badge" id="bottomNavCartCount">0</span>
+        </button>
+        <button class="nav-item" data-view="orders">
+            <span class="nav-icon"><i data-lucide="clipboard-list"></i></span>
+            <span class="nav-label">Pedidos</span>
+        </button>
+        <a class="nav-item nav-link" href="https://wa.me/593939962405" target="_blank" rel="noopener noreferrer" data-link="whatsapp">
+            <img src="assets/social-logos/whatsapp.png" alt="WhatsApp" class="nav-icon-img">
+            <span class="nav-label">WhatsApp</span>
+        </a>
+        <a class="nav-item nav-link" href="https://t.me/NovedadesCristy_gye" target="_blank" rel="noopener noreferrer" data-link="telegram">
+            <img src="assets/social-logos/telegram.png" alt="Telegram" class="nav-icon-img">
+            <span class="nav-label">Telegram</span>
+        </a>
+        <button class="nav-item" data-view="search" type="button" title="Buscar productos">
+            <span class="nav-icon"><i data-lucide="search"></i></span>
+            <span class="nav-label">Buscar</span>
+        </button>
+    </nav>
+
+    <!-- 加载提示 -->
+    <div class="toast" id="toast"></div>
+
+    <!-- 数量选择模态框 -->
+    <div class="modal-overlay hidden" id="quantityModal">
+        <div class="modal-content">
+            <div class="modal-header">
+                <h3 id="modalProductName">Seleccionar Cantidad</h3>
+                <button class="modal-close" id="modalCloseBtn" aria-label="Cerrar">×</button>
+            </div>
+            <div class="modal-body">
+                <div class="quantity-selector">
+                    <div class="quantity-control-large">
+                        <button class="quantity-btn-large" id="decreaseBtn">-</button>
+                        <input type="number" id="quantityInput" min="1" max="999" value="1" class="quantity-input-large">
+                        <button class="quantity-btn-large" id="increaseBtn">+</button>
+                    </div>
+                    <div class="quantity-info">
+                        <div class="product-price-modal" id="modalProductPrice">$0.00</div>
+                        <div class="total-price-modal" id="modalTotalPrice">Total: $0.00</div>
+                    </div>
+                </div>
+            </div>
+            <div class="modal-footer">
+                <button class="btn btn-secondary" id="modalCancelBtn">Cancelar</button>
+                <button class="btn btn-primary" id="modalConfirmBtn">Confirmar Añadir</button>
+            </div>
+        </div>
+    </div>
+
+    <!-- 图片大图模态框 -->
+    <div class="image-modal-overlay hidden" id="imageModal">
+        <div class="image-modal-content">
+            <button class="image-modal-close" id="imageModalCloseBtn" aria-label="Cerrar">×</button>
+            <img id="imageModalImg" src="" alt="Producto" class="image-modal-img">
+        </div>
+    </div>
+
+    <!-- CHANGE: 登录/注册模态框 -->
+    <div class="modal-overlay hidden" id="authModal">
+        <div class="modal-content" style="max-width: 400px;">
+            <div class="modal-header">
+                <h3 id="authModalTitle">Iniciar Sesión</h3>
+                <button class="modal-close" id="authModalCloseBtn" aria-label="Cerrar">×</button>
+            </div>
+            <div class="modal-body">
+                <!-- 登录表单 -->
+                <div id="loginForm">
+                    <form id="loginFormElement">
+                        <div class="form-group">
+                            <label for="loginEmail">Correo Electrónico</label>
+                            <input type="email" id="loginEmail" name="email" required placeholder="ejemplo@correo.com">
+                        </div>
+                        <div class="form-group">
+                            <label for="loginPassword">Contraseña</label>
+                            <input type="password" id="loginPassword" name="password" required placeholder="••••••••">
+                        </div>
+                        <button type="submit" class="btn btn-primary btn-block">Iniciar Sesión</button>
+                        <div class="auth-forgot" style="margin-top: 0.5rem; text-align: center;">
+                            <button type="button" class="link-btn" id="switchToForgot">¿Olvidaste tu contraseña?</button>
+                        </div>
+                    </form>
+                    <div class="auth-switch">
+                        <span>¿No tienes cuenta? </span>
+                        <button class="link-btn" id="switchToRegister">Regístrate</button>
+                    </div>
+                </div>
+                
+                <!-- CHANGE: 忘记密码表单 -->
+                <div id="forgotForm" class="hidden">
+                    <form id="forgotFormElement">
+                        <div class="form-group">
+                            <label for="forgotEmail">Correo Electrónico</label>
+                            <input type="email" id="forgotEmail" name="email" required placeholder="ejemplo@correo.com">
+                        </div>
+                        <button type="submit" class="btn btn-primary btn-block">Enviar enlace de recuperación</button>
+                    </form>
+                    <div id="forgotSuccess" class="hidden" style="margin-top: 1rem; padding: 0.75rem; background: #e8f5e9; border-radius: 6px; font-size: 0.9rem;">
+                        <p style="margin: 0 0 0.5rem;">Abre el siguiente enlace para restablecer tu contraseña (válido 24 horas):</p>
+                        <a id="forgotResetLink" href="#" target="_blank" style="word-break: break-all; color: var(--primary-color);"></a>
+                    </div>
+                    <div class="auth-switch">
+                        <button class="link-btn" id="switchToLoginFromForgot">Volver a iniciar sesión</button>
+                    </div>
+                </div>
+                
+                <!-- CHANGE: 重置密码表单（token 从 URL 带入） -->
+                <div id="resetForm" class="hidden">
+                    <form id="resetFormElement">
+                        <div class="form-group">
+                            <label for="resetPassword">Nueva Contraseña</label>
+                            <input type="password" id="resetPassword" name="password" required placeholder="Mínimo 6 caracteres" minlength="6">
+                        </div>
+                        <div class="form-group">
+                            <label for="resetPasswordConfirm">Confirmar Contraseña</label>
+                            <input type="password" id="resetPasswordConfirm" name="passwordConfirm" required placeholder="Repite la contraseña" minlength="6">
+                        </div>
+                        <button type="submit" class="btn btn-primary btn-block">Restablecer contraseña</button>
+                    </form>
+                    <div class="auth-switch">
+                        <button class="link-btn" id="switchToLoginFromReset">Volver a iniciar sesión</button>
+                    </div>
+                </div>
+                
+                <!-- 注册表单 -->
+                <div id="registerForm" class="hidden">
+                    <form id="registerFormElement">
+                        <div class="form-group">
+                            <label for="registerName">Nombre</label>
+                            <input type="text" id="registerName" name="name" placeholder="Tu nombre">
+                        </div>
+                        <div class="form-group">
+                            <label for="registerEmail">Correo Electrónico</label>
+                            <input type="email" id="registerEmail" name="email" required placeholder="ejemplo@correo.com">
+                        </div>
+                        <div class="form-group">
+                            <label for="registerPassword">Contraseña</label>
+                            <input type="password" id="registerPassword" name="password" required placeholder="Mínimo 6 caracteres" minlength="6">
+                        </div>
+                        <div class="form-group">
+                            <label for="registerPasswordConfirm">Confirmar Contraseña</label>
+                            <input type="password" id="registerPasswordConfirm" name="passwordConfirm" required placeholder="Repite la contraseña" minlength="6">
+                        </div>
+                        <button type="submit" class="btn btn-primary btn-block">Registrarse</button>
+                    </form>
+                    <div class="auth-switch">
+                        <span>¿Ya tienes cuenta? </span>
+                        <button class="link-btn" id="switchToLogin">Inicia sesión</button>
+                    </div>
+                </div>
+            </div>
+        </div>
+    </div>
+
+    <!-- 客户信息表单模态框 -->
+    <div class="modal-overlay hidden" id="customerInfoModal">
+        <div class="modal-content" style="max-width: 500px; max-height: 90vh; overflow-y: auto;">
+            <div class="modal-header">
+                <h3><i data-lucide="clipboard-list" class="modal-title-icon"></i> Datos para el pedido</h3>
+                <button class="modal-close" id="customerInfoModalCloseBtn" aria-label="Cerrar">×</button>
+            </div>
+            <div class="modal-body">
+                <p style="margin-bottom: 1.5rem; color: var(--text-light); font-size: 0.9rem;">
+                    Por favor, complete los siguientes datos para realizar su pedido:
+                </p>
+                <form id="customerInfoForm">
+                    <div class="form-group">
+                        <label for="cedula">Cédula O RUC <span style="color: var(--danger-color);">*</span></label>
+                        <input type="text" id="cedula" name="cedula" required placeholder="Ej: 0924844061">
+                    </div>
+                    <div class="form-group">
+                        <label for="nombres">Nombres y Apellidos <span style="color: var(--danger-color);">*</span></label>
+                        <input type="text" id="nombres" name="nombres" required placeholder="Ej: Juan Pérez">
+                    </div>
+                    <div class="form-group">
+                        <label for="direccion">Dirección <span style="color: var(--danger-color);">*</span></label>
+                        <input type="text" id="direccion" name="direccion" required placeholder="Ej: Av. Principal 123">
+                    </div>
+                    <div class="form-group">
+                        <label for="provincia">Provincia <span style="color: var(--danger-color);">*</span></label>
+                        <input type="text" id="provincia" name="provincia" required placeholder="Ej: Guayas">
+                    </div>
+                    <div class="form-group">
+                        <label for="ciudad">Ciudad <span style="color: var(--danger-color);">*</span></label>
+                        <input type="text" id="ciudad" name="ciudad" required placeholder="Ej: Guayaquil">
+                    </div>
+                    <div class="form-group">
+                        <label for="whatsapp">WhatsApp <span style="color: var(--danger-color);">*</span></label>
+                        <input type="tel" id="whatsapp" name="whatsapp" required placeholder="Ej: 0999999999">
+                    </div>
+                    <div class="form-group">
+                        <label for="email">E-Mail (Opcional)</label>
+                        <input type="email" id="email" name="email" placeholder="Ej: ejemplo@correo.com">
+                    </div>
+                </form>
+            </div>
+            <div class="modal-footer">
+                <button class="btn btn-secondary" id="customerInfoCancelBtn">Cancelar</button>
+                <button class="btn btn-primary" id="customerInfoSubmitBtn">Confirmar Pedido</button>
+            </div>
+        </div>
+    </div>
+
+    <!-- 脚本：相对路径确保 Pages 下 /pwa_cart/ 能加载到同目录的 config.js；版本号防缓存 -->
+    <script src="./config.js?v=10"></script>
+    <script src="./app.js?v=9"></script>
+</body>
+</html>
