@@ -841,9 +841,9 @@ class DatabaseManager:
             
             self.logger.info(f"🔍 共享数据库路径: {shared_db_path}")
             if not os.path.exists(shared_db_path):
-                error_msg = f"共享数据库文件不存在: {shared_db_path}"
-                self.logger.error(f"❌ {error_msg}")
-                raise RuntimeError(error_msg)
+                # NOTE: 云部署（如 Render）无 Sistema Factura 目录时跳过 unified_orders，仅保存到本地 orders/order_items
+                self.logger.warning(f"⚠️ 共享数据库文件不存在（已跳过 unified_orders）: {shared_db_path}")
+                return
             
             import importlib.util
             spec = importlib.util.spec_from_file_location("shared_database", shared_db_path)
@@ -1104,6 +1104,76 @@ class DatabaseManager:
             print(f"❌❌❌ 订单信息: order_id={order_id}, user_id={user_id}, total_amount={total_amount}")  # 控制台输出
             # CHANGE: 重新抛出异常，让调用者知道保存失败（这会导致订单创建失败，确保数据一致性）
             raise
+    
+    def get_orders_for_sync(self):
+        """获取所有订单，用于云端→本地同步；返回与 save_unified_order 一致的 order_data 列表。"""
+        SHIPPING_COST = 8.00
+        orders_out = []
+        conn = None
+        try:
+            conn = sqlite3.connect(self.db_path, timeout=10.0)
+            cursor = conn.cursor()
+            cursor.execute(
+                "SELECT name FROM sqlite_master WHERE type='table' AND name IN ('orders', 'order_items')"
+            )
+            tables = [row[0] for row in cursor.fetchall()]
+            if 'orders' not in tables or 'order_items' not in tables:
+                self.logger.warning("⚠️ get_orders_for_sync: orders 或 order_items 表不存在")
+                return orders_out
+            # NOTE: 不依赖 created_at，兼容 Render 上可能无该列的旧 schema
+            cursor.execute(
+                "SELECT id, user_id, total_amount, customer_info, COALESCE(status, 'pending') FROM orders ORDER BY id ASC"
+            )
+            rows = cursor.fetchall()
+            for row in rows:
+                order_id, user_id, total_amount, customer_info_json, status = row
+                cursor.execute(
+                    "SELECT product_id, quantity, price FROM order_items WHERE order_id = ? ORDER BY product_id",
+                    (order_id,)
+                )
+                items = cursor.fetchall()
+                cart_items = []
+                for pid, qty, price in items:
+                    cart_items.append({
+                        'code': str(pid),
+                        'name': str(pid),
+                        'quantity': int(qty),
+                        'price': float(price),
+                    })
+                try:
+                    customer_info = json.loads(customer_info_json) if customer_info_json else {}
+                except Exception:
+                    customer_info = {}
+                parts = (order_id or '').split('_')
+                invoice_num = parts[1] if len(parts) >= 2 and parts[1].isdigit() else f"{str(user_id)[-6:]:0>9}"
+                comprobante = f"001-002-{invoice_num}"
+                subtotal = float(total_amount or 0)
+                shipping = SHIPPING_COST
+                total = subtotal + shipping
+                order_data = {
+                    'order_id': order_id,
+                    'source': 'pwa',
+                    'user_id': str(user_id),
+                    'nota': None,
+                    'comprobante': comprobante,
+                    'customer_info': customer_info,
+                    'cart_items': cart_items,
+                    'subtotal': subtotal,
+                    'shipping': shipping,
+                    'total': total,
+                    'status': status or 'pending',
+                    'pdf_path': None,
+                }
+                orders_out.append(order_data)
+            self.logger.info(f"📋 get_orders_for_sync: 共 {len(orders_out)} 条订单")
+        except Exception as e:
+            self.logger.error(f"❌ get_orders_for_sync 失败: {e}")
+            import traceback
+            self.logger.error(traceback.format_exc())
+        finally:
+            if conn:
+                conn.close()
+        return orders_out
     
     def get_user_orders(self, user_id):
         """获取用户订单列表 - CHANGE: 优先从 shared_db.unified_orders 读取（与写入一致），保证 PEDIDOS total 与 CARRITO 一致"""

@@ -714,6 +714,7 @@ class PWACartAPIServer:
             # CHANGE: ruta_imagen 多为 D:\Cristy\Procesado\xxx.jpg，实际在 pwa_cart/Ya Subio/Cristy，返回 /api/images/ 或 Pages URL
             ruta = self._format_image_path(str(_r.get('ruta_imagen') or ''), 'Cristy')
             return {
+                'id': _r.get('id_producto'),
                 'name': (str(_r.get('nombre_producto') or '')).strip(),
                 'product_code': (str(_r.get('codigo_producto') or '')).strip(),
                 'price': float(_r.get('precio_unidad') or 0),
@@ -1223,6 +1224,7 @@ class PWACartAPIServer:
                     "/api/checkout": "提交订单 (POST)",
                     "/api/orders": "获取订单列表 (GET)",
                     "/api/orders/<order_id>": "获取订单详情 (GET)",
+                    "/api/sync/orders": "云端→本地同步订单 (GET, 需 X-Sync-Token 或 sync_token=SYNC_SECRET)",
                     "/api/payment/bank-info": "获取转账信息 (GET)",
                     "/api/health": "健康检查",
                     "/api/admin/sync-products-to-web": "将 Telegram 产品库同步到网页 (GET/POST)"
@@ -2474,25 +2476,14 @@ class PWACartAPIServer:
         
         @self.app.route('/api/cart', methods=['GET'])
         def get_cart():
-            """获取购物车"""
+            """获取购物车。仅信任JWT中的user_id，未登录返回空购物车，避免多用户串车。"""
             try:
-                # CHANGE: 优先从认证token获取user_id，如果没有则从参数获取
+                # CHANGE: 仅从认证token获取user_id，不接受 query 中的 user_id（防止未登录或伪造看到他人购物车）
                 user_id = None
                 if hasattr(request, 'user_id') and getattr(request, 'user_id', None):
                     user_id = getattr(request, 'user_id', None)
                     logger.info(f"📥 API获取购物车请求: 从token获取user_id={user_id}")
-                else:
-                    user_id_str = request.args.get('user_id')
-                    if user_id_str:
-                        try:
-                            user_id = int(user_id_str)
-                        except (ValueError, TypeError):
-                            logger.warning(f"⚠️ user_id格式错误: {user_id_str}，返回空购物车")
-                            return jsonify({
-                                "success": True,
-                                "data": []
-                            })
-                
+                # 无 token 时不再从 request.args 读取 user_id，直接返回空购物车
                 if not user_id or user_id <= 0:
                     logger.info("📥 API获取购物车请求: 无user_id，返回空购物车")
                     return jsonify({
@@ -2574,12 +2565,10 @@ class PWACartAPIServer:
                 if not data:
                     return jsonify({"error": "请求体为空"}), 400
                 
-                # CHANGE: 优先从认证token获取user_id
-                user_id = None
-                if hasattr(request, 'user_id') and getattr(request, 'user_id', None):
-                    user_id = getattr(request, 'user_id', None)
-                else:
-                    user_id = data.get('user_id')
+                # CHANGE: 仅从认证token获取user_id，未登录禁止操作购物车
+                user_id = getattr(request, 'user_id', None) if hasattr(request, 'user_id') else None
+                if not user_id or user_id <= 0:
+                    return jsonify({"error": "请先登录", "require_login": True}), 401
                 
                 product_id = data.get('product_id')
                 quantity = data.get('quantity', 1)
@@ -2593,7 +2582,7 @@ class PWACartAPIServer:
                 if unit_price is not None and unit_price > 0:
                     logger.info(f"🛒 API使用前端传入单价: {unit_price}")
                 
-                if not user_id or not product_id:
+                if not product_id:
                     return jsonify({"error": "缺少必要参数"}), 400
                 
                 if not self.cart_manager:
@@ -2631,12 +2620,14 @@ class PWACartAPIServer:
         
         @self.app.route('/api/cart/update', methods=['POST'])
         def update_cart():
-            """更新购物车商品数量"""
+            """更新购物车商品数量。仅信任JWT。"""
             try:
                 data = request.get_json()
                 if not data:
                     return jsonify({"error": "请求体为空"}), 400
-                user_id = data.get('user_id')
+                user_id = getattr(request, 'user_id', None) if hasattr(request, 'user_id') else None
+                if not user_id or user_id <= 0:
+                    return jsonify({"error": "请先登录", "require_login": True}), 401
                 product_id = data.get('product_id')
                 quantity = data.get('quantity')
                 unit_price = data.get('price')
@@ -2646,7 +2637,7 @@ class PWACartAPIServer:
                     except (ValueError, TypeError):
                         unit_price = None
                 
-                if not user_id or not product_id or quantity is None:
+                if not product_id or quantity is None:
                     return jsonify({"error": "缺少必要参数"}), 400
                 
                 if not self.cart_manager:
@@ -2668,15 +2659,16 @@ class PWACartAPIServer:
         
         @self.app.route('/api/cart/remove', methods=['POST'])
         def remove_from_cart():
-            """从购物车移除商品"""
+            """从购物车移除商品。仅信任JWT。"""
             try:
                 data = request.get_json()
                 if not data:
                     return jsonify({"error": "请求体为空"}), 400
-                user_id = data.get('user_id')
+                user_id = getattr(request, 'user_id', None) if hasattr(request, 'user_id') else None
+                if not user_id or user_id <= 0:
+                    return jsonify({"error": "请先登录", "require_login": True}), 401
                 product_id = data.get('product_id')
-                
-                if not user_id or not product_id:
+                if not product_id:
                     return jsonify({"error": "缺少必要参数"}), 400
                 
                 if not self.cart_manager:
@@ -2698,15 +2690,12 @@ class PWACartAPIServer:
         
         @self.app.route('/api/cart/clear', methods=['POST'])
         def clear_cart():
-            """清空购物车"""
+            """清空购物车。仅信任JWT。"""
             try:
-                data = request.get_json()
-                if not data:
-                    return jsonify({"error": "请求体为空"}), 400
-                user_id = data.get('user_id')
-                
-                if not user_id:
-                    return jsonify({"error": "缺少user_id参数"}), 400
+                data = request.get_json() or {}
+                user_id = getattr(request, 'user_id', None) if hasattr(request, 'user_id') else None
+                if not user_id or user_id <= 0:
+                    return jsonify({"error": "请先登录", "require_login": True}), 401
                 
                 if not self.cart_manager:
                     return jsonify({"error": "购物车管理器未可用"}), 500
@@ -2725,11 +2714,11 @@ class PWACartAPIServer:
         
         @self.app.route('/api/cart/total', methods=['GET'])
         def get_cart_total():
-            """计算购物车总价"""
+            """计算购物车总价。仅信任JWT。"""
             try:
-                user_id = request.args.get('user_id', type=int)
-                if not user_id:
-                    return jsonify({"error": "缺少user_id参数"}), 400
+                user_id = getattr(request, 'user_id', None) if hasattr(request, 'user_id') else None
+                if not user_id or user_id <= 0:
+                    return jsonify({"error": "请先登录", "require_login": True}), 401
                 
                 if not self.cart_manager:
                     return jsonify({"error": "购物车管理器未可用"}), 500
@@ -2758,24 +2747,14 @@ class PWACartAPIServer:
                 logger.info(f"📦 [checkout] 请求体含 subtotal={data.get('subtotal')}, total={data.get('total')}")
                 print(f"📦 [checkout] 请求体含 subtotal={data.get('subtotal')}, total={data.get('total')}")
                 
-                # CHANGE: 优先从认证token获取user_id
-                user_id = None
-                if hasattr(request, 'user_id') and getattr(request, 'user_id', None):
-                    user_id = getattr(request, 'user_id', None)
-                    logger.info(f"📦 从token获取user_id: {user_id}")
-                else:
-                    user_id = data.get('user_id')
-                    logger.info(f"📦 从请求体获取user_id: {user_id}")
-                
+                # CHANGE: 仅从认证token获取user_id，未登录禁止下单
+                user_id = getattr(request, 'user_id', None) if hasattr(request, 'user_id') else None
                 customer_info = data.get('customer_info', {})  # CHANGE: 获取客户信息
-                
                 logger.info(f"📦 收到订单提交请求: user_id={user_id}, type={type(user_id)}")
                 logger.info(f"👤 客户信息: {json.dumps(customer_info, ensure_ascii=False) if customer_info else '无'}")
-                
-                if not user_id:
-                    logger.error("❌ 缺少user_id参数")
-                    return jsonify({"error": "缺少user_id参数，请先登录"}), 400
-                
+                if not user_id or user_id <= 0:
+                    logger.error("❌ 未登录无法提交订单")
+                    return jsonify({"error": "请先登录", "require_login": True}), 401
                 # CHANGE: 验证客户信息
                 if not customer_info:
                     logger.error("❌ 缺少客户信息")
@@ -3095,23 +3074,11 @@ class PWACartAPIServer:
         
         @self.app.route('/api/orders', methods=['GET'])
         def get_orders():
-            """获取订单列表"""
+            """获取订单列表。仅信任JWT。"""
             try:
-                # CHANGE: 优先从认证token获取user_id
-                user_id = None
-                if hasattr(request, 'user_id') and getattr(request, 'user_id', None):
-                    user_id = getattr(request, 'user_id', None)
-                else:
-                    user_id_str = request.args.get('user_id')
-                    if not user_id_str:
-                        return jsonify({"error": "缺少user_id参数，请先登录"}), 400
-                    try:
-                        user_id = int(user_id_str)
-                    except (ValueError, TypeError):
-                        return jsonify({"error": f"user_id必须是整数: {user_id_str}"}), 400
-                
+                user_id = getattr(request, 'user_id', None) if hasattr(request, 'user_id') else None
                 if not user_id or user_id <= 0:
-                    return jsonify({"error": f"user_id必须是正整数: {user_id}"}), 400
+                    return jsonify({"error": "请先登录", "require_login": True}), 401
                 
                 if not self.db:
                     return jsonify({"error": "数据库未连接"}), 500
@@ -3135,21 +3102,11 @@ class PWACartAPIServer:
         
         @self.app.route('/api/orders/<order_id>', methods=['GET'])
         def get_order_detail(order_id):
-            """获取订单详情"""
+            """获取订单详情。仅信任JWT。"""
             try:
-                # CHANGE: 优先从认证token获取user_id
-                user_id = None
-                if hasattr(request, 'user_id') and getattr(request, 'user_id', None):
-                    user_id = getattr(request, 'user_id', None)
-                else:
-                    user_id_str = request.args.get('user_id')
-                    if not user_id_str:
-                        return jsonify({"error": "缺少user_id参数，请先登录"}), 400
-                    try:
-                        user_id = int(user_id_str)
-                    except (ValueError, TypeError):
-                        return jsonify({"error": f"user_id必须是整数: {user_id_str}"}), 400
-                
+                user_id = getattr(request, 'user_id', None) if hasattr(request, 'user_id') else None
+                if not user_id or user_id <= 0:
+                    return jsonify({"error": "请先登录", "require_login": True}), 401
                 if not self.db:
                     return jsonify({"error": "数据库未连接"}), 500
                 
@@ -3170,6 +3127,28 @@ class PWACartAPIServer:
                 import traceback
                 logger.error(traceback.format_exc())
                 return jsonify({"error": str(e)}), 500
+        
+        @self.app.route('/api/sync/orders', methods=['GET'])
+        def sync_orders():
+            """云端→本地同步：返回所有订单（unified_orders 格式），需 X-Sync-Token 或 sync_token 与 SYNC_SECRET 一致。"""
+            try:
+                sync_secret = os.environ.get('SYNC_SECRET', '').strip()
+                token = (request.headers.get('X-Sync-Token') or request.args.get('sync_token') or '').strip()
+                if not sync_secret:
+                    logger.warning("⚠️ [sync/orders] 未配置 SYNC_SECRET 环境变量")
+                    return jsonify({"error": "同步未配置（需设置 SYNC_SECRET）"}), 503
+                if token != sync_secret:
+                    return jsonify({"error": "无效的同步令牌"}), 401
+                if not self.db:
+                    return jsonify({"error": "数据库未连接"}), 500
+                orders = self.db.get_orders_for_sync()
+                logger.info(f"📋 [sync/orders] 返回 {len(orders)} 条订单")
+                return jsonify({"success": True, "data": orders})
+            except Exception as e:
+                import traceback
+                tb = traceback.format_exc()
+                logger.error(f"❌ [sync/orders] 失败: {e}\n{tb}")
+                return jsonify({"error": str(e), "detail": tb.splitlines()[-2] if tb else ""}), 500
         
         @self.app.route('/api/payment/bank-info', methods=['GET'])
         def get_bank_info():
