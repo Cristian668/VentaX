@@ -386,19 +386,27 @@ class DatabaseManager:
             return {}
     
     def get_product(self, product_id):
-        """获取单个产品"""
+        """获取单个产品。支持按 codigo_producto/product_code 或 id_producto/id 查询（其他供应商可能用 id 当 code）。"""
         try:
             conn = sqlite3.connect(self.db_path)
             cursor = conn.cursor()
-            
-            # CHANGE: 根据数据库类型选择不同的查询
+            pid_str = str(product_id).strip() if product_id is not None else ""
             if self.use_spanish_db:
-                cursor.execute('SELECT * FROM products WHERE codigo_producto = ?', (product_id,))
+                cursor.execute('SELECT * FROM products WHERE codigo_producto = ?', (pid_str,))
             else:
-                cursor.execute('SELECT * FROM products WHERE product_code = ?', (product_id,))
-            
+                cursor.execute('SELECT * FROM products WHERE product_code = ?', (pid_str,))
             row = cursor.fetchone()
-            
+            # CHANGE: 按代码未找到且入参为数字时，尝试按 id 查（如 1851 为 id_producto，codigo 为 XE82）
+            if row is None and pid_str and pid_str.isdigit():
+                try:
+                    pid_num = int(pid_str)
+                    if self.use_spanish_db:
+                        cursor.execute('SELECT * FROM products WHERE id_producto = ?', (pid_num,))
+                    else:
+                        cursor.execute('SELECT * FROM products WHERE id = ?', (pid_num,))
+                    row = cursor.fetchone()
+                except Exception:
+                    pass
             conn.close()
             
             if row:
@@ -1134,9 +1142,18 @@ class DatabaseManager:
                 items = cursor.fetchall()
                 cart_items = []
                 for pid, qty, price in items:
+                    # CHANGE: 用 product_id 查产品名称，保证同步到本地后 ITEM 显示名称而非 ID
+                    product_name = str(pid)
+                    try:
+                        prod = self.get_product(str(pid))
+                        if prod and prod.get('name'):
+                            product_name = (prod.get('name') or '').strip() or str(pid)
+                    except Exception:
+                        pass
                     cart_items.append({
+                        'product_id': str(pid),
                         'code': str(pid),
-                        'name': str(pid),
+                        'name': product_name,
                         'quantity': int(qty),
                         'price': float(price),
                     })

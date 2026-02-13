@@ -286,6 +286,19 @@ class PWACartAPIServer:
         # CHANGE: 方案 A 云端部署时用 R2 或 Cloudflare Pages；图片 URL 指向云端，不需本机 /api/images/
         self.r2_image_base_url = (os.getenv('R2_IMAGE_BASE_URL', '') or '').strip().rstrip('/')
         self.pages_image_base_url = (os.getenv('PAGES_IMAGE_BASE_URL', '') or '').strip().rstrip('/')
+        # CHANGE: 重置密码链接固定指向前端地址（如 https://ventax.pages.dev/pwa_cart），邮件/响应都用此 base
+        _reset_base = (os.getenv('RESET_LINK_BASE_URL', '') or '').strip().rstrip('/')
+        if not _reset_base:
+            try:
+                if os.path.isfile(_config_path):
+                    with open(_config_path, 'r', encoding='utf-8') as _f:
+                        _rc = json.load(_f)
+                    _reset_base = (str((_rc.get('pwa_cart') or {}).get('reset_link_base_url', '') or '').strip().rstrip('/'))
+            except Exception:
+                pass
+        self.reset_link_base_url = _reset_base or None
+        if self.reset_link_base_url:
+            logger.info(f"🔗 [API] 重置链接固定 base: {self.reset_link_base_url}")
         if self.r2_image_base_url:
             logger.info(f"📷 [API] 使用 R2 图片 base URL: {self.r2_image_base_url}")
         if self.pages_image_base_url:
@@ -412,7 +425,7 @@ class PWACartAPIServer:
                 # 返回JSON格式的错误响应
                 response = jsonify({
                     "success": False,
-                    "error": f"服务器内部错误: {error_msg}",
+                    "error": f"Error interno del servidor: {error_msg}",
                     "error_type": error_type,
                     "details": error_traceback if self.debug else None
                 })
@@ -760,7 +773,9 @@ class PWACartAPIServer:
         return out
 
     def _get_single_product_from_postgres_any(self, product_id: str) -> Optional[Dict]:
-        """从 PostgreSQL 按 id_producto/codigo_producto 查询单条产品（不限制 Cristy），供详情页回退。"""
+        """从 PostgreSQL 按 id_producto/codigo_producto 查询单条产品（不限制 Cristy），供详情页/购物车/同步补全。
+        CHANGE: 不再过滤 esta_activo，确保其他供应商产品（可能未设或为 FALSE）也能查到 name/code。
+        CHANGE: 若完整 pid 查不到，提取数字部分（如 TG_JUGUETESFANG_90029 -> 90029）再查 id_producto，Neon 中其他供应商常用 id 当主键。"""
         pg_config = self._get_pg_config()
         if not pg_config or not PSYCOPG2_AVAILABLE or psycopg2 is None:
             return None
@@ -768,24 +783,36 @@ class PWACartAPIServer:
         try:
             conn = self._pg_connect(pg_config)
             if not conn:
-                return []
+                return None
             cur = conn.cursor(cursor_factory=RealDictCursor)
             pid_str = str(product_id).strip()
-            cur.execute(
-                """
-                SELECT id_producto, codigo_producto, nombre_producto, descripcion,
-                       precio_unidad, precio_mayor, precio_bulto, categoria, ruta_imagen,
-                       inventario, codigo_proveedor, fecha_creacion, esta_activo
-                FROM products
-                WHERE (codigo_producto = %s OR id_producto::text = %s)
-                  AND (esta_activo IS NULL OR esta_activo = TRUE)
-                LIMIT 1
-                """,
-                (pid_str, pid_str),
-            )
-            r = cur.fetchone()
+            ids_to_try = [pid_str]
+            # CHANGE: 提取数字部分（如 TG_JUGUETESFANG_90029 -> 90029），Neon 中 codigo_producto 可能为 XE02，id_producto=90029
+            nums = re.findall(r'\d+', pid_str)
+            for n in reversed(nums):
+                if n and n not in ids_to_try:
+                    ids_to_try.append(n)
+            r = None
+            for try_id in ids_to_try:
+                cur.execute(
+                    """
+                    SELECT id_producto, codigo_producto, nombre_producto, descripcion,
+                           precio_unidad, precio_mayor, precio_bulto, categoria, ruta_imagen,
+                           inventario, codigo_proveedor, fecha_creacion, esta_activo
+                    FROM products
+                    WHERE codigo_producto = %s OR id_producto::text = %s
+                    LIMIT 1
+                    """,
+                    (try_id, try_id),
+                )
+                r = cur.fetchone()
+                if r:
+                    if try_id != pid_str:
+                        logger.info("📋 [PG any] 用数字 id=%s 匹配到 product_id=%s", try_id, pid_str)
+                    break
             cur.close()
             if not r:
+                logger.debug("📋 [PG any] 未找到 product_id=%s（已尝试 %s）", pid_str, ids_to_try)
                 return None
             try:
                 _r = {str(k).lower(): v for k, v in r.items()}
@@ -795,10 +822,13 @@ class PWACartAPIServer:
             if created_at is not None and hasattr(created_at, 'isoformat'):
                 created_at = created_at.isoformat()
             ruta = self._format_image_path(str(_r.get('ruta_imagen') or ''), (_r.get('codigo_proveedor') or '').strip())
+            code = (str(_r.get('codigo_producto') or '')).strip()
+            name = (str(_r.get('nombre_producto') or '')).strip()
+            logger.info("📋 [PG any] 找到 product_id=%s -> codigo=%s, nombre=%s", pid_str, code, (name or "")[:50])
             return {
                 'id': _r.get('id_producto'),
-                'name': (str(_r.get('nombre_producto') or '')).strip(),
-                'product_code': (str(_r.get('codigo_producto') or '')).strip(),
+                'name': name,
+                'product_code': code,
                 'price': float(_r.get('precio_unidad') or 0),
                 'wholesale_price': float(_r.get('precio_mayor') or 0),
                 'bulk_price': float(_r.get('precio_bulto') or 0),
@@ -1198,8 +1228,8 @@ class PWACartAPIServer:
             logger.warning(f"❌ 未找到图片: {filename}，可配置目录: {image_dirs}")
             print(f"❌ [API] 未找到图片: {filename}，请检查 port_config.json 中 pwa_cart.product_image_dirs")
             resp = jsonify({
-                "error": f"图片未找到: {filename}",
-                "hint": "请将同名文件放入以下任一目录（根或子文件夹均可）: " + ", ".join(image_dirs)
+                "error": f"Imagen no encontrada: {filename}",
+                "hint": "Coloque el archivo con el mismo nombre en uno de estos directorios: " + ", ".join(image_dirs)
             })
             resp.headers['Cache-Control'] = 'no-store, no-cache, must-revalidate'
             return resp, 404
@@ -1208,8 +1238,8 @@ class PWACartAPIServer:
         def api_info():
             """API信息"""
             return jsonify({
-                "service": "PWA购物车API服务器",
-                "description": "为PWA购物车网页提供RESTful API接口",
+                "service": "API del carrito PWA",
+                "description": "API REST para la página del carrito PWA",
                 "version": "1.0.0",
                 "endpoints": {
                     "/": "PWA主页",
@@ -1236,7 +1266,7 @@ class PWACartAPIServer:
             """健康检查"""
             return jsonify({
                 "status": "healthy",
-                "service": "PWA购物车API",
+                "service": "API del carrito PWA",
                 "timestamp": datetime.now().isoformat(),
                 "database": "connected" if self.db else "disconnected"
             })
@@ -1385,24 +1415,24 @@ class PWACartAPIServer:
             try:
                 data = request.get_json()
                 if not data:
-                    return jsonify({"success": False, "error": "请求体为空"}), 400
+                    return jsonify({"success": False, "error": "El cuerpo de la solicitud está vacío"}), 400
                 
                 email = data.get('email', '').strip().lower()
                 password = data.get('password', '')
                 name = data.get('name', '').strip()
                 
                 if not email:
-                    return jsonify({"success": False, "error": "邮箱不能为空"}), 400
+                    return jsonify({"success": False, "error": "El correo no puede estar vacío"}), 400
                 if not password or len(password) < 6:
-                    return jsonify({"success": False, "error": "密码至少需要6个字符"}), 400
+                    return jsonify({"success": False, "error": "La contraseña debe tener al menos 6 caracteres"}), 400
                 
                 if not self.db:
-                    return jsonify({"success": False, "error": "数据库未连接"}), 500
+                    return jsonify({"success": False, "error": "Base de datos no conectada"}), 500
                 
                 # 检查邮箱是否已存在
                 existing_user = self.db.get_user_by_email(email)
                 if existing_user:
-                    return jsonify({"success": False, "error": "邮箱已被注册"}), 400
+                    return jsonify({"success": False, "error": "El correo ya está registrado"}), 400
                 
                 # 创建用户
                 password_hash = self._hash_password(password)
@@ -1420,20 +1450,20 @@ class PWACartAPIServer:
                 if not JWT_AVAILABLE:
                     logger.error("❌ JWT库未安装，无法生成token")
                     print("❌ JWT库未安装，无法生成token")  # 控制台输出
-                    return jsonify({"success": False, "error": "JWT库未安装，请运行: pip install PyJWT"}), 500
+                    return jsonify({"success": False, "error": "JWT no instalado. Ejecute: pip install PyJWT"}), 500
                 
                 try:
                     token = self._generate_token(user_id, email)
                     if not token:
                         logger.error(f"❌ 生成token失败: user_id={user_id}, email={email}, _generate_token返回None")
                         print(f"❌ 生成token失败: user_id={user_id}, email={email}, _generate_token返回None")  # 控制台输出
-                        return jsonify({"success": False, "error": "生成token失败，请检查服务器日志"}), 500
+                        return jsonify({"success": False, "error": "Error al generar el token. Compruebe los logs del servidor"}), 500
                 except Exception as token_error:
                     logger.error(f"❌ 生成token时发生异常: {token_error}")
                     import traceback
                     logger.error(traceback.format_exc())
                     print(f"❌ 生成token时发生异常: {token_error}")  # 控制台输出
-                    return jsonify({"success": False, "error": f"生成token失败: {str(token_error)}"}), 500
+                    return jsonify({"success": False, "error": f"Error al generar el token: {str(token_error)}"}), 500
                 
                 # 更新最后登录时间
                 self.db.update_user_last_login(user_id)
@@ -1448,7 +1478,7 @@ class PWACartAPIServer:
                         "name": name if name else email.split('@')[0],
                         "token": token
                     },
-                    "message": "注册成功"
+                    "message": "Registro exitoso"
                 })
                 
             except Exception as e:
@@ -1463,19 +1493,20 @@ class PWACartAPIServer:
             try:
                 data = request.get_json()
                 if not data:
-                    return jsonify({"success": False, "error": "请求体为空"}), 400
+                    return jsonify({"success": False, "error": "El cuerpo de la solicitud está vacío"}), 400
                 
                 email = data.get('email', '').strip().lower()
-                password = data.get('password', '')
+                # NOTE: 对密码做 strip，避免复制粘贴首尾空格导致验证失败
+                password = (data.get('password') or '').strip()
                 
                 logger.info(f"🔐 登录尝试: email={email}, password_length={len(password)}")
                 print(f"🔐 登录尝试: email={email}, password_length={len(password)}")  # 控制台输出
                 
                 if not email or not password:
-                    return jsonify({"success": False, "error": "邮箱和密码不能为空"}), 400
+                    return jsonify({"success": False, "error": "El correo y la contraseña no pueden estar vacíos"}), 400
                 
                 if not self.db:
-                    return jsonify({"success": False, "error": "数据库未连接"}), 500
+                    return jsonify({"success": False, "error": "Base de datos no conectada"}), 500
                 
                 # 获取用户
                 user = self.db.get_user_by_email(email)
@@ -1485,7 +1516,7 @@ class PWACartAPIServer:
                 if not user:
                     logger.warning(f"❌ 用户不存在: email={email}")
                     print(f"❌ 用户不存在: email={email}")  # 控制台输出
-                    return jsonify({"success": False, "error": "邮箱或密码错误"}), 401
+                    return jsonify({"success": False, "error": "Correo o contraseña incorrectos"}), 401
                 
                 # 验证密码
                 password_hash_in_db = user.get('password_hash', '')
@@ -1501,17 +1532,17 @@ class PWACartAPIServer:
                 if not password_verify_result:
                     logger.warning(f"❌ 密码验证失败: email={email}")
                     print(f"❌ 密码验证失败: email={email}")  # 控制台输出
-                    return jsonify({"success": False, "error": "邮箱或密码错误"}), 401
+                    return jsonify({"success": False, "error": "Correo o contraseña incorrectos"}), 401
                 
                 # 检查用户是否激活
                 if not user.get('is_active', True):
-                    return jsonify({"success": False, "error": "账户已被禁用"}), 403
+                    return jsonify({"success": False, "error": "La cuenta está deshabilitada"}), 403
                 
                 # 生成token
                 if not JWT_AVAILABLE:
                     logger.error("❌ JWT库未安装，无法生成token")
                     print("❌ JWT库未安装，无法生成token")  # 控制台输出
-                    return jsonify({"success": False, "error": "JWT库未安装，请运行: pip install PyJWT"}), 500
+                    return jsonify({"success": False, "error": "JWT no instalado. Ejecute: pip install PyJWT"}), 500
                 
                 logger.info(f"🔑 开始生成token: user_id={user['id']}, email={email}, JWT_AVAILABLE={JWT_AVAILABLE}")
                 print(f"🔑 开始生成token: user_id={user['id']}, email={email}, JWT_AVAILABLE={JWT_AVAILABLE}")  # 控制台输出
@@ -1521,7 +1552,7 @@ class PWACartAPIServer:
                     if not token:
                         logger.error(f"❌ 生成token失败: user_id={user['id']}, email={email}, _generate_token返回None")
                         print(f"❌ 生成token失败: user_id={user['id']}, email={email}, _generate_token返回None")  # 控制台输出
-                        return jsonify({"success": False, "error": "生成token失败，请检查服务器日志"}), 500
+                        return jsonify({"success": False, "error": "Error al generar el token. Compruebe los logs del servidor"}), 500
                     logger.info(f"✅ Token生成成功: user_id={user['id']}, token长度={len(token)}")
                     print(f"✅ Token生成成功: user_id={user['id']}, token长度={len(token)}")  # 控制台输出
                 except Exception as token_error:
@@ -1530,7 +1561,7 @@ class PWACartAPIServer:
                     logger.error(traceback.format_exc())
                     print(f"❌ 生成token时发生异常: {token_error}")  # 控制台输出
                     print(traceback.format_exc())  # 控制台输出
-                    return jsonify({"success": False, "error": f"生成token失败: {str(token_error)}"}), 500
+                    return jsonify({"success": False, "error": f"Error al generar el token: {str(token_error)}"}), 500
                 
                 # 更新最后登录时间
                 self.db.update_user_last_login(user['id'])
@@ -1561,23 +1592,23 @@ class PWACartAPIServer:
             try:
                 data = request.get_json()
                 if not data:
-                    return jsonify({"success": False, "error": "请求体为空"}), 400
+                    return jsonify({"success": False, "error": "El cuerpo de la solicitud está vacío"}), 400
                 
                 token = data.get('token')
                 if not token:
-                    return jsonify({"success": False, "error": "token不能为空"}), 400
+                    return jsonify({"success": False, "error": "El token no puede estar vacío"}), 400
                 
                 payload = self._verify_token(token)
                 if not payload:
-                    return jsonify({"success": False, "error": "token无效或已过期"}), 401
+                    return jsonify({"success": False, "error": "Token inválido o expirado"}), 401
                 
                 # 获取用户信息
                 if not self.db:
-                    return jsonify({"success": False, "error": "数据库未连接"}), 500
+                    return jsonify({"success": False, "error": "Base de datos no conectada"}), 500
                 
                 user = self.db.get_user_by_id(payload.get('user_id'))
                 if not user:
-                    return jsonify({"success": False, "error": "用户不存在"}), 404
+                    return jsonify({"success": False, "error": "El usuario no existe"}), 404
                 
                 return jsonify({
                     "success": True,
@@ -1600,24 +1631,31 @@ class PWACartAPIServer:
             try:
                 data = request.get_json()
                 if not data:
-                    return jsonify({"success": False, "error": "请求体为空"}), 400
+                    return jsonify({"success": False, "error": "El cuerpo de la solicitud está vacío"}), 400
                 email = data.get('email', '').strip().lower()
                 if not email:
-                    return jsonify({"success": False, "error": "邮箱不能为空"}), 400
+                    return jsonify({"success": False, "error": "El correo no puede estar vacío"}), 400
                 if not self.db:
-                    return jsonify({"success": False, "error": "数据库未连接"}), 500
+                    return jsonify({"success": False, "error": "Base de datos no conectada"}), 500
                 token = secrets.token_urlsafe(32)
                 token_hash = hashlib.sha256(token.encode()).hexdigest()
                 expires_at = (datetime.utcnow() + timedelta(hours=24)).strftime('%Y-%m-%d %H:%M:%S')
                 user_id = self.db.create_password_reset_token(email, token_hash, expires_at)
                 if not user_id:
-                    return jsonify({"success": True, "message": "若该邮箱已注册，将收到重置链接"}), 200
-                base_url = request.url_root.rstrip('/')
-                reset_url = f"{base_url}/pwa_cart/#/reset?token={token}"
+                    # NOTE: 未发送邮件；链接仅在邮箱已注册时于页面上显示
+                    return jsonify({"success": True, "message": "Si el correo está registrado, el enlace de restablecimiento aparecerá en esta página (no se envía por correo)."}), 200
+                # CHANGE: 优先用 RESET_LINK_BASE_URL，使链接始终指向固定前端（如 https://ventax.pages.dev/pwa_cart）
+                if self.reset_link_base_url:
+                    reset_url = f"{self.reset_link_base_url}/#/reset?token={token}"
+                else:
+                    base_url = request.url_root.rstrip('/')
+                    reset_url = f"{base_url}/pwa_cart/#/reset?token={token}"
+                # CHANGE: 同时返回 reset_token，供前端直接弹重置表单，无需用户点击链接（避免客户抗拒链接/担心诈骗）
                 return jsonify({
                     "success": True,
                     "reset_url": reset_url,
-                    "message": "Abre el siguiente enlace para restablecer tu contraseña (válido 24 horas)"
+                    "reset_token": token,
+                    "message": "Introduce tu nueva contraseña a continuación."
                 }), 200
             except Exception as e:
                 logger.error(f"❌ 忘记密码失败: {e}")
@@ -1630,22 +1668,22 @@ class PWACartAPIServer:
             try:
                 data = request.get_json()
                 if not data:
-                    return jsonify({"success": False, "error": "请求体为空"}), 400
+                    return jsonify({"success": False, "error": "El cuerpo de la solicitud está vacío"}), 400
                 token = data.get('token', '').strip()
                 new_password = data.get('password', '')
                 if not token:
-                    return jsonify({"success": False, "error": "Token 不能为空"}), 400
+                    return jsonify({"success": False, "error": "El token no puede estar vacío"}), 400
                 if not new_password or len(new_password) < 6:
-                    return jsonify({"success": False, "error": "密码至少需要6个字符"}), 400
+                    return jsonify({"success": False, "error": "La contraseña debe tener al menos 6 caracteres"}), 400
                 if not self.db:
-                    return jsonify({"success": False, "error": "数据库未连接"}), 500
+                    return jsonify({"success": False, "error": "Base de datos no conectada"}), 500
                 token_hash = hashlib.sha256(token.encode()).hexdigest()
                 user = self.db.get_user_by_reset_token(token_hash)
                 if not user:
                     return jsonify({"success": False, "error": "Enlace inválido o expirado"}), 400
                 password_hash = self._hash_password(new_password)
                 if not self.db.update_password_and_clear_reset(user['id'], password_hash):
-                    return jsonify({"success": False, "error": "更新密码失败"}), 500
+                    return jsonify({"success": False, "error": "Error al actualizar la contraseña"}), 500
                 return jsonify({"success": True, "message": "Contraseña restablecida correctamente"}), 200
             except Exception as e:
                 logger.error(f"❌ 重置密码失败: {e}")
@@ -1661,7 +1699,7 @@ class PWACartAPIServer:
             print(f"📥 [API] 收到 /api/products 请求 supplier={supplier!r}, search={search!r}")
             try:
                 if not self.db:
-                    return jsonify({"error": "数据库未连接"}), 500
+                    return jsonify({"error": "Base de datos no conectada"}), 500
                 
                 # 获取查询参数
                 supplier_lower = (supplier or '').strip().lower()  # 统一小写比较，避免 Others/others 等导致走错分支
@@ -2289,7 +2327,7 @@ class PWACartAPIServer:
             """获取产品详情（SQLite + PostgreSQL Cristy 回退）。CHANGE: 支持 10060_Al/10060_A 等 URL 与 DB 10060/10060._AI 多候选匹配；支持 Telegram 展示码 18bf4405 通过映射解析。"""
             try:
                 if not self.db and USE_SQLITE_FOR_PRODUCTS:
-                    return jsonify({"error": "数据库未连接"}), 500
+                    return jsonify({"error": "Base de datos no conectada"}), 500
                 # CHANGE: 保留 URL 中的 id，响应时返回此值以便前端 #/product/18bf4405 能匹配卡片
                 requested_id = product_id
                 mapping = _load_display_code_mapping()
@@ -2362,7 +2400,7 @@ class PWACartAPIServer:
                     except Exception as e:
                         logger.debug(f"SQLite 产品回退失败: {requested_id}, {e}")
                 if not product:
-                    return jsonify({"error": "产品不存在"}), 404
+                    return jsonify({"error": "El producto no existe"}), 404
                 
                 # CHANGE: 转换图片路径为URL - 处理所有可能的路径格式；统一去掉文件名方括号与 D:\Ya Subio 实际文件名一致
                 image_path = product.get('image_path', '')
@@ -2493,7 +2531,7 @@ class PWACartAPIServer:
                 
                 if not self.cart_manager:
                     logger.error("❌ 购物车管理器未可用")
-                    return jsonify({"error": "购物车管理器未可用"}), 500
+                    return jsonify({"error": "Gestor del carrito no disponible"}), 500
                 
                 logger.info(f"📥 API获取购物车请求: user_id={user_id}")
                 logger.info(f"📥 CartManager实例: {self.cart_manager}")
@@ -2525,7 +2563,68 @@ class PWACartAPIServer:
                 
                 cart = self.cart_manager.get_user_cart(user_id)
                 logger.info(f"🛒 获取购物车: user_id={user_id}, 商品数={len(cart)}")
+                # CHANGE: 用 Neon（PG）补全其他供应商的 name/code/price，与 sync/orders、checkout 一致；云端 SQLite 无产品时必走此处
+                def _is_placeholder_name(n):
+                    if not n or not str(n).strip():
+                        return True
+                    u = (str(n).strip()).upper()
+                    if u in ('NAN', 'NONE', 'NULL') or u == 'PRODUCTO' or u == 'PRODUCTO NUEVO':
+                        return True
+                    if u.startswith('PRODUCTO ') and len(u) > 9:
+                        return True
+                    return False
                 if cart:
+                    # NOTE: 此日志用于确认 Render 已部署到含 Neon 补全的版本；若无此条则仍在跑旧代码
+                    logger.info("📋 [GET /api/cart] 购物车有 %d 项，开始用 Neon(PG) 补全 name/code/price", len(cart))
+                    try:
+                        pg_ok = self._get_pg_config() is not None
+                        logger.info("📋 [GET /api/cart] DATABASE_URL=%s", "已配置" if pg_ok else "未配置")
+                        if not pg_ok:
+                            logger.warning("⚠️ [GET /api/cart] DATABASE_URL 未配置，无法从 Neon 补全 name/code，请到 Render 环境变量设置 DATABASE_URL（Neon 连接串）")
+                        filled = 0
+                        for it in cart:
+                            pid = str(it.get('product_id') or it.get('code') or '').strip()
+                            if not pid:
+                                continue
+                            name = str(it.get('name') or '').strip()
+                            code = str(it.get('code') or pid).strip()
+                            if not _is_placeholder_name(name) and code != pid:
+                                continue
+                            pg_prod = self._get_single_product_from_postgres_any(pid)
+                            if not pg_prod:
+                                continue
+                            pg_name = (pg_prod.get('name') or '').strip()
+                            pg_code = (pg_prod.get('product_code') or pg_prod.get('id') or '').strip()
+                            if pg_name:
+                                it['name'] = pg_name
+                            if pg_code:
+                                it['code'] = pg_code
+                            # CHANGE: 同时补全 price，否则云端 SQLite 无产品时 GET /api/cart 一直返回 price:0.0
+                            qty = float(it.get('quantity') or 0)
+                            if qty <= 0:
+                                qty = 1.0
+                            pu = float(pg_prod.get('price') or pg_prod.get('precio_unidad') or 0)
+                            pm = float(pg_prod.get('wholesale_price') or pg_prod.get('precio_mayor') or 0)
+                            pb = float(pg_prod.get('bulk_price') or pg_prod.get('precio_bulto') or 0)
+                            if pu <= 0:
+                                pu = pm if pm > 0 else pb
+                            if pm <= 0:
+                                pm = pu
+                            if pb <= 0:
+                                pb = pm
+                            if qty >= 12 and pb > 0:
+                                it['price'] = pb
+                            elif qty >= 3 and pm > 0:
+                                it['price'] = pm
+                            elif pu > 0:
+                                it['price'] = pu
+                            if pg_name or pg_code:
+                                filled += 1
+                                logger.info("📋 [GET /api/cart] Neon 补全: product_id=%s -> code=%s, name=%s, price=%s", pid, pg_code or pid, (pg_name or "")[:50], it.get('price'))
+                        if filled:
+                            logger.info("📋 [GET /api/cart] 共 %d 项已用 Neon(PG) 补全 name/code", filled)
+                    except Exception as e:
+                        logger.warning("⚠️ [GET /api/cart] 用 PG 补全 name/code 失败: %s", e)
                     logger.info(f"🛒 购物车内容: {[item.get('product_id') for item in cart]}")
                 else:
                     logger.warning(f"⚠️ 购物车为空: user_id={user_id}")
@@ -2563,12 +2662,12 @@ class PWACartAPIServer:
             try:
                 data = request.get_json()
                 if not data:
-                    return jsonify({"error": "请求体为空"}), 400
+                    return jsonify({"error": "El cuerpo de la solicitud está vacío"}), 400
                 
                 # CHANGE: 仅从认证token获取user_id，未登录禁止操作购物车
                 user_id = getattr(request, 'user_id', None) if hasattr(request, 'user_id') else None
                 if not user_id or user_id <= 0:
-                    return jsonify({"error": "请先登录", "require_login": True}), 401
+                    return jsonify({"error": "Inicie sesión primero", "require_login": True}), 401
                 
                 product_id = data.get('product_id')
                 quantity = data.get('quantity', 1)
@@ -2583,10 +2682,10 @@ class PWACartAPIServer:
                     logger.info(f"🛒 API使用前端传入单价: {unit_price}")
                 
                 if not product_id:
-                    return jsonify({"error": "缺少必要参数"}), 400
+                    return jsonify({"error": "Faltan parámetros obligatorios"}), 400
                 
                 if not self.cart_manager:
-                    return jsonify({"error": "购物车管理器未可用"}), 500
+                    return jsonify({"error": "Gestor del carrito no disponible"}), 500
                 
                 logger.info(f"🛒 API添加产品到购物车: user_id={user_id}, product_id={product_id}, quantity={quantity}, unit_price={unit_price}")
                 logger.info(f"🛒 CartManager实例: {self.cart_manager}")
@@ -2612,7 +2711,7 @@ class PWACartAPIServer:
                     })
                 else:
                     logger.error(f"❌ 添加失败: user_id={user_id}, product_id={product_id}")
-                    return jsonify({"error": "添加失败，请检查产品ID是否正确"}), 500
+                    return jsonify({"error": "Error al añadir. Compruebe que el ID del producto sea correcto"}), 500
                 
             except Exception as e:
                 logger.error(f"❌ 添加到购物车失败: {e}")
@@ -2624,10 +2723,10 @@ class PWACartAPIServer:
             try:
                 data = request.get_json()
                 if not data:
-                    return jsonify({"error": "请求体为空"}), 400
+                    return jsonify({"error": "El cuerpo de la solicitud está vacío"}), 400
                 user_id = getattr(request, 'user_id', None) if hasattr(request, 'user_id') else None
                 if not user_id or user_id <= 0:
-                    return jsonify({"error": "请先登录", "require_login": True}), 401
+                    return jsonify({"error": "Inicie sesión primero", "require_login": True}), 401
                 product_id = data.get('product_id')
                 quantity = data.get('quantity')
                 unit_price = data.get('price')
@@ -2638,20 +2737,20 @@ class PWACartAPIServer:
                         unit_price = None
                 
                 if not product_id or quantity is None:
-                    return jsonify({"error": "缺少必要参数"}), 400
+                    return jsonify({"error": "Faltan parámetros obligatorios"}), 400
                 
                 if not self.cart_manager:
-                    return jsonify({"error": "购物车管理器未可用"}), 500
+                    return jsonify({"error": "Gestor del carrito no disponible"}), 500
                 
                 success = self.cart_manager.update_quantity(user_id, product_id, quantity, unit_price=unit_price)
                 
                 if success:
                     return jsonify({
                         "success": True,
-                        "message": "购物车已更新"
+                        "message": "Carrito actualizado"
                     })
                 else:
-                    return jsonify({"error": "更新失败"}), 500
+                    return jsonify({"error": "Error al actualizar"}), 500
                 
             except Exception as e:
                 logger.error(f"❌ 更新购物车失败: {e}")
@@ -2663,16 +2762,16 @@ class PWACartAPIServer:
             try:
                 data = request.get_json()
                 if not data:
-                    return jsonify({"error": "请求体为空"}), 400
+                    return jsonify({"error": "El cuerpo de la solicitud está vacío"}), 400
                 user_id = getattr(request, 'user_id', None) if hasattr(request, 'user_id') else None
                 if not user_id or user_id <= 0:
-                    return jsonify({"error": "请先登录", "require_login": True}), 401
+                    return jsonify({"error": "Inicie sesión primero", "require_login": True}), 401
                 product_id = data.get('product_id')
                 if not product_id:
-                    return jsonify({"error": "缺少必要参数"}), 400
+                    return jsonify({"error": "Faltan parámetros obligatorios"}), 400
                 
                 if not self.cart_manager:
-                    return jsonify({"error": "购物车管理器未可用"}), 500
+                    return jsonify({"error": "Gestor del carrito no disponible"}), 500
                 
                 success = self.cart_manager.remove_from_cart(user_id, product_id)
                 
@@ -2682,7 +2781,7 @@ class PWACartAPIServer:
                         "message": "商品已从购物车移除"
                     })
                 else:
-                    return jsonify({"error": "移除失败"}), 500
+                    return jsonify({"error": "Error al eliminar"}), 500
                 
             except Exception as e:
                 logger.error(f"❌ 从购物车移除失败: {e}")
@@ -2695,10 +2794,10 @@ class PWACartAPIServer:
                 data = request.get_json() or {}
                 user_id = getattr(request, 'user_id', None) if hasattr(request, 'user_id') else None
                 if not user_id or user_id <= 0:
-                    return jsonify({"error": "请先登录", "require_login": True}), 401
+                    return jsonify({"error": "Inicie sesión primero", "require_login": True}), 401
                 
                 if not self.cart_manager:
-                    return jsonify({"error": "购物车管理器未可用"}), 500
+                    return jsonify({"error": "Gestor del carrito no disponible"}), 500
                 
                 # 保存空购物车
                 self.cart_manager.save_user_cart(user_id, [])
@@ -2718,10 +2817,10 @@ class PWACartAPIServer:
             try:
                 user_id = getattr(request, 'user_id', None) if hasattr(request, 'user_id') else None
                 if not user_id or user_id <= 0:
-                    return jsonify({"error": "请先登录", "require_login": True}), 401
+                    return jsonify({"error": "Inicie sesión primero", "require_login": True}), 401
                 
                 if not self.cart_manager:
-                    return jsonify({"error": "购物车管理器未可用"}), 500
+                    return jsonify({"error": "Gestor del carrito no disponible"}), 500
                 
                 total = self.cart_manager.get_cart_total(user_id)
                 
@@ -2742,7 +2841,7 @@ class PWACartAPIServer:
             try:
                 data = request.get_json()
                 if not data:
-                    return jsonify({"error": "请求体为空"}), 400
+                    return jsonify({"error": "El cuerpo de la solicitud está vacío"}), 400
                 # CHANGE: 便于确认前端是否发送 subtotal/total（PEDIDOS=CARRITO）
                 logger.info(f"📦 [checkout] 请求体含 subtotal={data.get('subtotal')}, total={data.get('total')}")
                 print(f"📦 [checkout] 请求体含 subtotal={data.get('subtotal')}, total={data.get('total')}")
@@ -2754,29 +2853,29 @@ class PWACartAPIServer:
                 logger.info(f"👤 客户信息: {json.dumps(customer_info, ensure_ascii=False) if customer_info else '无'}")
                 if not user_id or user_id <= 0:
                     logger.error("❌ 未登录无法提交订单")
-                    return jsonify({"error": "请先登录", "require_login": True}), 401
+                    return jsonify({"error": "Inicie sesión primero", "require_login": True}), 401
                 # CHANGE: 验证客户信息
                 if not customer_info:
                     logger.error("❌ 缺少客户信息")
-                    return jsonify({"error": "缺少客户信息"}), 400
+                    return jsonify({"error": "Faltan datos del cliente"}), 400
                 
                 required_fields = ['cedula', 'nombres', 'direccion', 'provincia', 'ciudad', 'whatsapp']
                 for field in required_fields:
                     if not customer_info.get(field):
                         logger.error(f"❌ 客户信息缺少必填字段: {field}")
-                        return jsonify({"error": f"客户信息缺少必填字段: {field}"}), 400
+                        return jsonify({"error": f"Datos del cliente: falta el campo obligatorio: {field}"}), 400
                 
                 # 确保user_id是整数类型
                 try:
                     user_id = int(user_id)
                 except (ValueError, TypeError) as e:
                     logger.error(f"❌ user_id类型转换失败: {user_id}, error={e}")
-                    return jsonify({"error": f"user_id必须是整数: {user_id}"}), 400
+                    return jsonify({"error": f"user_id debe ser un número entero: {user_id}"}), 400
                 
                 if not self.cart_manager or not self.db:
                     logger.error("❌ 服务未可用: cart_manager={}, db={}".format(
                         self.cart_manager is not None, self.db is not None))
-                    return jsonify({"error": "服务未可用"}), 500
+                    return jsonify({"error": "Servicio no disponible"}), 500
                 
                 # 获取购物车
                 cart = self.cart_manager.get_user_cart(user_id)
@@ -2786,7 +2885,7 @@ class PWACartAPIServer:
                     logger.warning(f"⚠️ 购物车是空的: user_id={user_id}")
                     return jsonify({
                         "success": False,
-                        "error": "购物车是空的，请先添加商品",
+                        "error": "El carrito está vacío. Añada productos primero",
                         "error_type": "EmptyCart"
                     }), 400
                 
@@ -2946,7 +3045,7 @@ class PWACartAPIServer:
                     logger.error(f"❌ 购物车总价无效: {total}")
                     return jsonify({
                         "success": False,
-                        "error": "购物车总价无效，请检查商品数据",
+                        "error": "El total del carrito no es válido. Compruebe los datos de los productos",
                         "error_type": "InvalidTotal"
                     }), 400
                 
@@ -3006,7 +3105,7 @@ class PWACartAPIServer:
                     logger.error(f"❌ create_order返回None: user_id={user_id}, cart_items={len(cart)}")
                     return jsonify({
                         "success": False,
-                        "error": "创建订单失败: 订单ID为空",
+                        "error": "Error al crear el pedido: el ID del pedido está vacío",
                         "error_type": "OrderCreationFailed",
                         "user_id": user_id,
                         "cart_items_count": len(cart)
@@ -3078,10 +3177,10 @@ class PWACartAPIServer:
             try:
                 user_id = getattr(request, 'user_id', None) if hasattr(request, 'user_id') else None
                 if not user_id or user_id <= 0:
-                    return jsonify({"error": "请先登录", "require_login": True}), 401
+                    return jsonify({"error": "Inicie sesión primero", "require_login": True}), 401
                 
                 if not self.db:
-                    return jsonify({"error": "数据库未连接"}), 500
+                    return jsonify({"error": "Base de datos no conectada"}), 500
                 
                 orders = self.db.get_user_orders(user_id)
                 logger.info(f"📋 获取订单列表: user_id={user_id}, 订单数={len(orders)}")
@@ -3106,14 +3205,14 @@ class PWACartAPIServer:
             try:
                 user_id = getattr(request, 'user_id', None) if hasattr(request, 'user_id') else None
                 if not user_id or user_id <= 0:
-                    return jsonify({"error": "请先登录", "require_login": True}), 401
+                    return jsonify({"error": "Inicie sesión primero", "require_login": True}), 401
                 if not self.db:
-                    return jsonify({"error": "数据库未连接"}), 500
+                    return jsonify({"error": "Base de datos no conectada"}), 500
                 
                 order_detail = self.db.get_order_detail(order_id, user_id)
                 
                 if not order_detail:
-                    return jsonify({"error": "订单不存在或无权限访问"}), 404
+                    return jsonify({"error": "El pedido no existe o no tiene permiso para acceder"}), 404
                 
                 logger.info(f"📋 获取订单详情: order_id={order_id}, user_id={user_id}")
                 
@@ -3130,18 +3229,53 @@ class PWACartAPIServer:
         
         @self.app.route('/api/sync/orders', methods=['GET'])
         def sync_orders():
-            """云端→本地同步：返回所有订单（unified_orders 格式），需 X-Sync-Token 或 sync_token 与 SYNC_SECRET 一致。"""
+            """云端→本地同步：返回所有订单（unified_orders 格式），需 X-Sync-Token 或 sync_token 与 SYNC_SECRET 一致。
+            CHANGE: 返回前用 Neon（PostgreSQL）补全 cart_items 的 code/name，与 checkout 一致，避免其他供应商产品只显示 product_id/PRODUCTO NUEVO。"""
             try:
                 sync_secret = os.environ.get('SYNC_SECRET', '').strip()
                 token = (request.headers.get('X-Sync-Token') or request.args.get('sync_token') or '').strip()
                 if not sync_secret:
                     logger.warning("⚠️ [sync/orders] 未配置 SYNC_SECRET 环境变量")
-                    return jsonify({"error": "同步未配置（需设置 SYNC_SECRET）"}), 503
+                    return jsonify({"error": "Sincronización no configurada (configure SYNC_SECRET)"}), 503
                 if token != sync_secret:
-                    return jsonify({"error": "无效的同步令牌"}), 401
+                    return jsonify({"error": "Token de sincronización inválido"}), 401
                 if not self.db:
-                    return jsonify({"error": "数据库未连接"}), 500
+                    return jsonify({"error": "Base de datos no conectada"}), 500
                 orders = self.db.get_orders_for_sync()
+                # CHANGE: 用 Neon（PostgreSQL）补全其他供应商产品的 codigo_producto / nombre_producto，与 Neon Console Tablas 一致
+                def _is_placeholder(n):
+                    if not n or not str(n).strip():
+                        return True
+                    u = (str(n).strip()).upper()
+                    if u in ('NAN', 'NONE', 'NULL') or u == 'PRODUCTO' or u == 'PRODUCTO NUEVO':
+                        return True
+                    if u.startswith('PRODUCTO ') and len(u) > 9:
+                        return True
+                    return False
+                try:
+                    for order_data in orders:
+                        items = order_data.get('cart_items') or []
+                        for it in items:
+                            pid = str(it.get('product_id') or it.get('code') or '').strip()
+                            if not pid:
+                                continue
+                            name = str(it.get('name') or '').strip()
+                            code = str(it.get('code') or pid).strip()
+                            if not _is_placeholder(name) and code != pid:
+                                continue
+                            pg_prod = self._get_single_product_from_postgres_any(pid)
+                            if not pg_prod:
+                                continue
+                            pg_name = (pg_prod.get('name') or '').strip()
+                            pg_code = (pg_prod.get('product_code') or pg_prod.get('id') or '').strip()
+                            if pg_name:
+                                it['name'] = pg_name
+                            if pg_code:
+                                it['code'] = pg_code
+                            if pg_name or pg_code:
+                                logger.debug(f"  📋 [sync/orders] 补全 cart_item: pid={pid} -> code={pg_code}, name={pg_name[:40] if pg_name else ''}")
+                except Exception as e:
+                    logger.warning("⚠️ [sync/orders] 用 PG 补全 cart_items 失败（继续返回）: %s", e)
                 logger.info(f"📋 [sync/orders] 返回 {len(orders)} 条订单")
                 return jsonify({"success": True, "data": orders})
             except Exception as e:
