@@ -22,8 +22,14 @@ import logging
 from urllib.parse import quote
 import sqlite3
 import hashlib  # CHANGE: hashlib是标准库，应该始终可用，移到外面
+import time
 from datetime import datetime, timedelta
 from typing import Dict, List, Optional, Tuple, Any
+
+# CHANGE: API 响应缓存，减少重复请求对 DB 的压力
+_API_CACHE = {}
+_API_CACHE_TTL_PRODUCTS = 60   # 产品列表缓存 60 秒
+_API_CACHE_TTL_BANK = 300     # 银行信息缓存 5 分钟
 
 # CHANGE: 暂时註销 SQLite 产品数据，产品列表/详情仅用 PostgreSQL（购物车/订单/登录仍用 CartManager 内 db）
 USE_SQLITE_FOR_PRODUCTS = False
@@ -52,7 +58,7 @@ ULTIMO_IMAGE_DIR = PWA_YA_SUBIO_CRISTY
 
 # 尝试导入Flask
 try:
-    from flask import Flask, jsonify, request
+    from flask import Flask, jsonify, request, redirect
     from flask_cors import CORS
     FLASK_AVAILABLE = True
 except ImportError:
@@ -208,6 +214,30 @@ JWT_SECRET_KEY = os.getenv('JWT_SECRET_KEY', 'ventax-secret-key-change-in-produc
 JWT_ALGORITHM = 'HS256'
 JWT_EXPIRATION_HOURS = 24 * 7  # 7天
 
+
+def _cached_api_response(cache_key_fn, ttl):
+    """CHANGE: API 响应缓存装饰器，cache_key_fn(request) 返回缓存 key"""
+    def decorator(f):
+        def wrapped(*a, **kw):
+            from flask import request
+            key = cache_key_fn(request)
+            if key in _API_CACHE:
+                exp, data = _API_CACHE[key]
+                if exp > time.time():
+                    return jsonify(data)
+            result = f(*a, **kw)
+            resp = result[0] if isinstance(result, tuple) else result
+            try:
+                d = resp.get_json() if hasattr(resp, 'get_json') else None
+                if d and d.get('success'):
+                    _API_CACHE[key] = (time.time() + ttl, d)
+            except Exception:
+                pass
+            return result
+        return wrapped
+    return decorator
+
+
 class PWACartAPIServer:
     """PWA购物车API服务器类"""
     
@@ -327,15 +357,38 @@ class PWACartAPIServer:
             # 设置静态文件目录
             static_folder = os.path.join(os.path.dirname(__file__), 'pwa_cart')
             self.app = Flask(__name__, static_folder=static_folder, static_url_path='/pwa_cart')
-            # CHANGE: 明确允许云端页 ventax.pages.dev、预览部署 *.ventax.pages.dev 与本机，避免 CORS 拦截
+            # CHANGE: 明确允许云端页 ventax.pages.dev、ventaxpages.com、预览部署 *.ventax.pages.dev 与本机，避免 CORS 拦截
             _cors_origins = [
-                "https://ventax.pages.dev", "http://localhost:5000", "http://127.0.0.1:5000",
+                "https://ventax.pages.dev", "https://ventaxpages.com",
+                "http://localhost:5000", "http://127.0.0.1:5000",
                 "http://localhost", "http://127.0.0.1"
             ]
             _extra = (os.getenv('CORS_EXTRA_ORIGINS') or '').strip().split(',')
             _cors_origins.extend([o.strip() for o in _extra if o.strip()])
             _cors_origins.append("https://df6334cd.ventax.pages.dev")  # Wrangler 预览部署
             CORS(self.app, origins=_cors_origins, supports_credentials=True)
+
+            # CHANGE: 所有响应（含 4xx/5xx）都加 CORS，避免 Render 错误响应无头导致浏览器报 CORS
+            _cors_origins_set = set(_cors_origins)
+
+            @self.app.after_request
+            def cors_ventax_pages_preview(response):
+                origin = request.environ.get('HTTP_ORIGIN') or request.headers.get('Origin')
+                if not origin:
+                    return response
+                allow = False
+                if origin in _cors_origins_set:
+                    allow = True
+                elif re.match(r'^https://[a-z0-9-]+\.ventax\.pages\.dev$', origin):
+                    allow = True
+                if allow:
+                    response.headers['Access-Control-Allow-Origin'] = origin
+                    response.headers['Access-Control-Allow-Credentials'] = 'true'
+                    response.headers['Access-Control-Expose-Headers'] = 'Content-Type'
+                    if request.method == 'OPTIONS':
+                        response.headers['Access-Control-Allow-Methods'] = 'GET, POST, PUT, PATCH, DELETE, OPTIONS'
+                        response.headers['Access-Control-Allow-Headers'] = 'Content-Type, Authorization'
+                return response
             
             # CHANGE: /pwa_cart/api/* 重写为 /api/*，便于前端在 /pwa_cart/ 页时统一用 /pwa_cart/api 避免 404（如反向代理只转发 /pwa_cart 时）
             @self.app.before_request
@@ -483,6 +536,263 @@ class PWACartAPIServer:
         """验证密码"""
         return self._hash_password(password) == password_hash
 
+    # CHANGE: 云端用户存储 - 当 DATABASE_URL 存在时，用户数据写入 PostgreSQL（Neon），避免 Render 冷启动后 SQLite 重置导致用户丢失
+    def _use_pg_for_users(self) -> bool:
+        """是否使用 PostgreSQL 存储用户（云端部署时 True）"""
+        return bool(self._get_pg_config())
+
+    def _ensure_pwa_users_table(self, pg_config: Dict) -> bool:
+        """确保 PostgreSQL 中存在 pwa_users 表"""
+        if not pg_config or not PSYCOPG2_AVAILABLE or psycopg2 is None:
+            return False
+        conn = None
+        try:
+            conn = self._pg_connect(pg_config)
+            cur = conn.cursor()
+            cur.execute("""
+                CREATE TABLE IF NOT EXISTS pwa_users (
+                    id SERIAL PRIMARY KEY,
+                    email VARCHAR(255) UNIQUE,
+                    password_hash TEXT,
+                    google_id VARCHAR(255) UNIQUE,
+                    name VARCHAR(255),
+                    avatar_url TEXT,
+                    registration_method VARCHAR(50) DEFAULT 'email',
+                    email_verified BOOLEAN DEFAULT FALSE,
+                    is_active BOOLEAN DEFAULT TRUE,
+                    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                    updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                    last_login TIMESTAMP,
+                    password_reset_token TEXT,
+                    password_reset_expires TIMESTAMP
+                )
+            """)
+            conn.commit()
+            cur.close()
+            logger.info("✅ pwa_users 表已就绪（PostgreSQL）")
+            return True
+        except Exception as e:
+            logger.error(f"❌ 创建 pwa_users 表失败: {e}")
+            return False
+        finally:
+            if conn:
+                conn.close()
+
+    def _pg_get_user_by_email(self, email: str) -> Optional[Dict]:
+        """从 PostgreSQL 按邮箱获取用户"""
+        pg_config = self._get_pg_config()
+        if not pg_config or not PSYCOPG2_AVAILABLE or psycopg2 is None:
+            return None
+        conn = None
+        try:
+            conn = self._pg_connect(pg_config)
+            cur = conn.cursor(cursor_factory=RealDictCursor)
+            cur.execute("""
+                SELECT id, email, password_hash, google_id, name, avatar_url,
+                       registration_method, email_verified, is_active, created_at, last_login
+                FROM pwa_users WHERE LOWER(email) = LOWER(%s)
+            """, (email.strip().lower() if email else '',))
+            row = cur.fetchone()
+            cur.close()
+            if not row:
+                return None
+            r = dict(row)
+            return {
+                'id': r.get('id'),
+                'email': r.get('email'),
+                'password_hash': r.get('password_hash') or '',
+                'google_id': r.get('google_id'),
+                'name': r.get('name'),
+                'avatar_url': r.get('avatar_url'),
+                'registration_method': r.get('registration_method') or 'email',
+                'email_verified': bool(r.get('email_verified')),
+                'is_active': bool(r.get('is_active', True)),
+                'created_at': r.get('created_at'),
+                'last_login': r.get('last_login')
+            }
+        except Exception as e:
+            logger.error(f"❌ _pg_get_user_by_email 失败: {e}")
+            return None
+        finally:
+            if conn:
+                conn.close()
+
+    def _pg_get_user_by_id(self, user_id: int) -> Optional[Dict]:
+        """从 PostgreSQL 按 ID 获取用户"""
+        pg_config = self._get_pg_config()
+        if not pg_config or not PSYCOPG2_AVAILABLE or psycopg2 is None:
+            return None
+        conn = None
+        try:
+            conn = self._pg_connect(pg_config)
+            cur = conn.cursor(cursor_factory=RealDictCursor)
+            cur.execute("""
+                SELECT id, email, password_hash, google_id, name, avatar_url,
+                       registration_method, email_verified, is_active, created_at, last_login
+                FROM pwa_users WHERE id = %s
+            """, (user_id,))
+            row = cur.fetchone()
+            cur.close()
+            if not row:
+                return None
+            r = dict(row)
+            return {
+                'id': r.get('id'),
+                'email': r.get('email'),
+                'password_hash': r.get('password_hash') or '',
+                'google_id': r.get('google_id'),
+                'name': r.get('name'),
+                'avatar_url': r.get('avatar_url'),
+                'registration_method': r.get('registration_method') or 'email',
+                'email_verified': bool(r.get('email_verified')),
+                'is_active': bool(r.get('is_active', True)),
+                'created_at': r.get('created_at'),
+                'last_login': r.get('last_login')
+            }
+        except Exception as e:
+            logger.error(f"❌ _pg_get_user_by_id 失败: {e}")
+            return None
+        finally:
+            if conn:
+                conn.close()
+
+    def _pg_create_user(self, email: str, password_hash: str, name: str = None,
+                        google_id: str = None, avatar_url: str = None,
+                        registration_method: str = 'email') -> Tuple[Optional[int], Optional[str]]:
+        """在 PostgreSQL 创建用户，返回 (user_id, error)"""
+        pg_config = self._get_pg_config()
+        if not pg_config or not PSYCOPG2_AVAILABLE or psycopg2 is None:
+            return None, "PostgreSQL 未配置"
+        self._ensure_pwa_users_table(pg_config)
+        conn = None
+        try:
+            conn = self._pg_connect(pg_config)
+            cur = conn.cursor()
+            cur.execute("SELECT id FROM pwa_users WHERE LOWER(email) = LOWER(%s)", (email.strip().lower(),))
+            if cur.fetchone():
+                cur.close()
+                return None, "邮箱已被注册"
+            display_name = (name or email.split('@')[0]) if email else ''
+            cur.execute("""
+                INSERT INTO pwa_users (email, password_hash, name, google_id, avatar_url, registration_method, email_verified)
+                VALUES (%s, %s, %s, %s, %s, %s, %s)
+                RETURNING id
+            """, (email.strip().lower(), password_hash, display_name, google_id, avatar_url,
+                  registration_method, 1 if google_id else 0))
+            row = cur.fetchone()
+            user_id = row[0] if row else None
+            conn.commit()
+            cur.close()
+            logger.info(f"✅ PostgreSQL 用户创建成功: user_id={user_id}, email={email}")
+            return user_id, None
+        except Exception as e:
+            if conn:
+                conn.rollback()
+            logger.error(f"❌ _pg_create_user 失败: {e}")
+            return None, str(e)
+        finally:
+            if conn:
+                conn.close()
+
+    def _pg_update_user_last_login(self, user_id: int) -> bool:
+        """更新 PostgreSQL 用户最后登录时间"""
+        pg_config = self._get_pg_config()
+        if not pg_config or not PSYCOPG2_AVAILABLE or psycopg2 is None:
+            return False
+        conn = None
+        try:
+            conn = self._pg_connect(pg_config)
+            cur = conn.cursor()
+            cur.execute("UPDATE pwa_users SET last_login = NOW() WHERE id = %s", (user_id,))
+            conn.commit()
+            cur.close()
+            return True
+        except Exception as e:
+            if conn:
+                conn.rollback()
+            logger.error(f"❌ _pg_update_user_last_login 失败: {e}")
+            return False
+        finally:
+            if conn:
+                conn.close()
+
+    def _pg_create_password_reset_token(self, email: str, token_hash: str, expires_at) -> Optional[int]:
+        """在 PostgreSQL 创建密码重置 token，返回 user_id"""
+        pg_config = self._get_pg_config()
+        if not pg_config or not PSYCOPG2_AVAILABLE or psycopg2 is None:
+            return None
+        user = self._pg_get_user_by_email(email)
+        if not user:
+            return None
+        conn = None
+        try:
+            conn = self._pg_connect(pg_config)
+            cur = conn.cursor()
+            cur.execute("""
+                UPDATE pwa_users SET password_reset_token = %s, password_reset_expires = %s WHERE id = %s
+            """, (token_hash, expires_at, user['id']))
+            conn.commit()
+            cur.close()
+            return user['id']
+        except Exception as e:
+            if conn:
+                conn.rollback()
+            logger.error(f"❌ _pg_create_password_reset_token 失败: {e}")
+            return None
+        finally:
+            if conn:
+                conn.close()
+
+    def _pg_get_user_by_reset_token(self, token_hash: str) -> Optional[Dict]:
+        """从 PostgreSQL 按重置 token 获取用户"""
+        pg_config = self._get_pg_config()
+        if not pg_config or not PSYCOPG2_AVAILABLE or psycopg2 is None:
+            return None
+        conn = None
+        try:
+            conn = self._pg_connect(pg_config)
+            cur = conn.cursor(cursor_factory=RealDictCursor)
+            cur.execute("""
+                SELECT id, email, password_hash, name FROM pwa_users
+                WHERE password_reset_token = %s AND password_reset_expires > NOW()
+            """, (token_hash,))
+            row = cur.fetchone()
+            cur.close()
+            if not row:
+                return None
+            r = dict(row)
+            return {'id': r['id'], 'email': r['email'], 'password_hash': r.get('password_hash'), 'name': r.get('name')}
+        except Exception as e:
+            logger.error(f"❌ _pg_get_user_by_reset_token 失败: {e}")
+            return None
+        finally:
+            if conn:
+                conn.close()
+
+    def _pg_update_password_and_clear_reset(self, user_id: int, password_hash: str) -> bool:
+        """在 PostgreSQL 更新密码并清除重置 token"""
+        pg_config = self._get_pg_config()
+        if not pg_config or not PSYCOPG2_AVAILABLE or psycopg2 is None:
+            return False
+        conn = None
+        try:
+            conn = self._pg_connect(pg_config)
+            cur = conn.cursor()
+            cur.execute("""
+                UPDATE pwa_users SET password_hash = %s, password_reset_token = NULL, password_reset_expires = NULL WHERE id = %s
+            """, (password_hash, user_id))
+            conn.commit()
+            cur.close()
+            return True
+        except Exception as e:
+            if conn:
+                conn.rollback()
+            logger.error(f"❌ _pg_update_password_and_clear_reset 失败: {e}")
+            return False
+        finally:
+            if conn:
+                conn.close()
+
     def _get_pg_config(self) -> Optional[Dict[str, Any]]:
         """从 database_config.json 或 DATABASE_URL 环境变量读取 PostgreSQL 配置（ULTIMO 产品数据源）。
         CHANGE: 方案 A 云端部署时优先用 DATABASE_URL（Neon 等托管 PG 提供）。
@@ -523,13 +833,7 @@ class PWACartAPIServer:
         basename = _normalize_image_filename(os.path.basename(ruta_norm))
         if not basename:
             return ''
-        # Cloudflare Pages：一键同步上传了 pwa_cart/Ya Subio（含 Cristy），URL 为 base/Ya%20Subio/Cristy/xxx 或 base/Ya%20Subio/xxx
-        if getattr(self, 'pages_image_base_url', None):
-            seg = quote('Ya Subio', safe='/')
-            sub = 'Cristy/' if (supplier or '').strip() == 'Cristy' else ''
-            return f"{self.pages_image_base_url}/{seg}/{sub}{quote(basename, safe='/')}"
-        if self.r2_image_base_url:
-            return f"{self.r2_image_base_url}/{basename}"
+        # CHANGE: 统一返回 /api/images/xxx，由前端根据当前站点拼出 Pages 或本机 API 地址（一键同步已把 R2 图片打包到 Pages，无需 R2_IMAGE_BASE_URL）
         return '/api/images/' + basename
 
     def _pg_connect(self, pg_config: Dict) -> "Any":
@@ -1034,7 +1338,17 @@ class PWACartAPIServer:
         if not self.app:
             logger.error("❌ Flask应用未初始化，无法设置路由")
             return
+        # CHANGE: 云端部署时启动时确保 pwa_users 表存在
+        if self._use_pg_for_users():
+            pg_cfg = self._get_pg_config()
+            if pg_cfg:
+                self._ensure_pwa_users_table(pg_cfg)
         
+        @self.app.route('/health')
+        def health():
+            """CHANGE: 轻量健康检查，供 Render/UptimeRobot 快速 ping，避免 No open HTTP ports"""
+            return jsonify({"status": "ok"}), 200
+
         @self.app.route('/')
         def home():
             """主页 - 重定向到PWA"""
@@ -1224,12 +1538,17 @@ class PWACartAPIServer:
                     logger.info(f"✅ 图片（可配置目录子文件夹）: {found_path}")
                     return send_from_directory(found_dir, found_file)
             
-            # 未在可配置目录中找到；改 port_config.json 中 pwa_cart.product_image_dirs 指向正确文件夹即可
+            # 未在可配置目录中找到；若配置了 R2_IMAGE_BASE_URL 则重定向到 R2（Render 上无本地 Ya Subio 时用）
+            r2_base = getattr(self, 'r2_image_base_url', None) or (os.getenv('R2_IMAGE_BASE_URL', '') or '').strip().rstrip('/')
+            if r2_base:
+                redirect_url = f"{r2_base}/{quote(base_filename_clean or base_filename)}"
+                logger.info(f"📷 本地无图，重定向到 R2: {redirect_url}")
+                return redirect(redirect_url, code=302)
             logger.warning(f"❌ 未找到图片: {filename}，可配置目录: {image_dirs}")
-            print(f"❌ [API] 未找到图片: {filename}，请检查 port_config.json 中 pwa_cart.product_image_dirs")
+            print(f"❌ [API] 未找到图片: {filename}，请检查 port_config.json 或设置 R2_IMAGE_BASE_URL")
             resp = jsonify({
                 "error": f"Imagen no encontrada: {filename}",
-                "hint": "Coloque el archivo con el mismo nombre en uno de estos directorios: " + ", ".join(image_dirs)
+                "hint": "Coloque el archivo en pwa_cart/Ya Subio/Cristy o configure R2_IMAGE_BASE_URL en Render."
             })
             resp.headers['Cache-Control'] = 'no-store, no-cache, must-revalidate'
             return resp, 404
@@ -1418,7 +1737,8 @@ class PWACartAPIServer:
                     return jsonify({"success": False, "error": "El cuerpo de la solicitud está vacío"}), 400
                 
                 email = data.get('email', '').strip().lower()
-                password = data.get('password', '')
+                # NOTE: 与登录一致，对密码做 strip，避免复制粘贴首尾空格导致注册/登录哈希不一致
+                password = (data.get('password') or '').strip()
                 name = data.get('name', '').strip()
                 
                 if not email:
@@ -1426,22 +1746,33 @@ class PWACartAPIServer:
                 if not password or len(password) < 6:
                     return jsonify({"success": False, "error": "La contraseña debe tener al menos 6 caracteres"}), 400
                 
-                if not self.db:
-                    return jsonify({"success": False, "error": "Base de datos no conectada"}), 500
-                
-                # 检查邮箱是否已存在
-                existing_user = self.db.get_user_by_email(email)
-                if existing_user:
-                    return jsonify({"success": False, "error": "El correo ya está registrado"}), 400
-                
-                # 创建用户
-                password_hash = self._hash_password(password)
-                user_id, error = self.db.create_user(
-                    email=email,
-                    password_hash=password_hash,
-                    name=name if name else email.split('@')[0],
-                    registration_method='email'
-                )
+                # CHANGE: 云端优先用 PostgreSQL 存储用户
+                if self._use_pg_for_users():
+                    if not self._get_pg_config():
+                        return jsonify({"success": False, "error": "Base de datos no conectada"}), 500
+                    existing_user = self._pg_get_user_by_email(email)
+                    if existing_user:
+                        return jsonify({"success": False, "error": "El correo ya está registrado"}), 400
+                    password_hash = self._hash_password(password)
+                    user_id, error = self._pg_create_user(
+                        email=email,
+                        password_hash=password_hash,
+                        name=name if name else email.split('@')[0],
+                        registration_method='email'
+                    )
+                else:
+                    if not self.db:
+                        return jsonify({"success": False, "error": "Base de datos no conectada"}), 500
+                    existing_user = self.db.get_user_by_email(email)
+                    if existing_user:
+                        return jsonify({"success": False, "error": "El correo ya está registrado"}), 400
+                    password_hash = self._hash_password(password)
+                    user_id, error = self.db.create_user(
+                        email=email,
+                        password_hash=password_hash,
+                        name=name if name else email.split('@')[0],
+                        registration_method='email'
+                    )
                 
                 if error:
                     return jsonify({"success": False, "error": error}), 400
@@ -1466,7 +1797,10 @@ class PWACartAPIServer:
                     return jsonify({"success": False, "error": f"Error al generar el token: {str(token_error)}"}), 500
                 
                 # 更新最后登录时间
-                self.db.update_user_last_login(user_id)
+                if self._use_pg_for_users():
+                    self._pg_update_user_last_login(user_id)
+                else:
+                    self.db.update_user_last_login(user_id)
                 
                 logger.info(f"✅ 用户注册成功: user_id={user_id}, email={email}")
                 
@@ -1505,11 +1839,15 @@ class PWACartAPIServer:
                 if not email or not password:
                     return jsonify({"success": False, "error": "El correo y la contraseña no pueden estar vacíos"}), 400
                 
-                if not self.db:
-                    return jsonify({"success": False, "error": "Base de datos no conectada"}), 500
-                
-                # 获取用户
-                user = self.db.get_user_by_email(email)
+                # CHANGE: 云端优先用 PostgreSQL 获取用户
+                if self._use_pg_for_users():
+                    if not self._get_pg_config():
+                        return jsonify({"success": False, "error": "Base de datos no conectada"}), 500
+                    user = self._pg_get_user_by_email(email)
+                else:
+                    if not self.db:
+                        return jsonify({"success": False, "error": "Base de datos no conectada"}), 500
+                    user = self.db.get_user_by_email(email)
                 logger.info(f"🔍 查询用户结果: user={'存在' if user else '不存在'}, email={email}")
                 print(f"🔍 查询用户结果: user={'存在' if user else '不存在'}, email={email}")  # 控制台输出
                 
@@ -1564,7 +1902,10 @@ class PWACartAPIServer:
                     return jsonify({"success": False, "error": f"Error al generar el token: {str(token_error)}"}), 500
                 
                 # 更新最后登录时间
-                self.db.update_user_last_login(user['id'])
+                if self._use_pg_for_users():
+                    self._pg_update_user_last_login(user['id'])
+                else:
+                    self.db.update_user_last_login(user['id'])
                 
                 logger.info(f"✅ 用户登录成功: user_id={user['id']}, email={email}")
                 
@@ -1602,11 +1943,15 @@ class PWACartAPIServer:
                 if not payload:
                     return jsonify({"success": False, "error": "Token inválido o expirado"}), 401
                 
-                # 获取用户信息
-                if not self.db:
-                    return jsonify({"success": False, "error": "Base de datos no conectada"}), 500
-                
-                user = self.db.get_user_by_id(payload.get('user_id'))
+                # CHANGE: 云端优先从 PostgreSQL 获取用户
+                if self._use_pg_for_users():
+                    if not self._get_pg_config():
+                        return jsonify({"success": False, "error": "Base de datos no conectada"}), 500
+                    user = self._pg_get_user_by_id(payload.get('user_id'))
+                else:
+                    if not self.db:
+                        return jsonify({"success": False, "error": "Base de datos no conectada"}), 500
+                    user = self.db.get_user_by_id(payload.get('user_id'))
                 if not user:
                     return jsonify({"success": False, "error": "El usuario no existe"}), 404
                 
@@ -1635,12 +1980,20 @@ class PWACartAPIServer:
                 email = data.get('email', '').strip().lower()
                 if not email:
                     return jsonify({"success": False, "error": "El correo no puede estar vacío"}), 400
-                if not self.db:
-                    return jsonify({"success": False, "error": "Base de datos no conectada"}), 500
+                # CHANGE: 云端优先用 PostgreSQL
+                if self._use_pg_for_users():
+                    if not self._get_pg_config():
+                        return jsonify({"success": False, "error": "Base de datos no conectada"}), 500
+                else:
+                    if not self.db:
+                        return jsonify({"success": False, "error": "Base de datos no conectada"}), 500
                 token = secrets.token_urlsafe(32)
                 token_hash = hashlib.sha256(token.encode()).hexdigest()
                 expires_at = (datetime.utcnow() + timedelta(hours=24)).strftime('%Y-%m-%d %H:%M:%S')
-                user_id = self.db.create_password_reset_token(email, token_hash, expires_at)
+                if self._use_pg_for_users():
+                    user_id = self._pg_create_password_reset_token(email, token_hash, expires_at)
+                else:
+                    user_id = self.db.create_password_reset_token(email, token_hash, expires_at)
                 if not user_id:
                     # NOTE: 未发送邮件；链接仅在邮箱已注册时于页面上显示
                     return jsonify({"success": True, "message": "Si el correo está registrado, el enlace de restablecimiento aparecerá en esta página (no se envía por correo)."}), 200
@@ -1675,14 +2028,26 @@ class PWACartAPIServer:
                     return jsonify({"success": False, "error": "El token no puede estar vacío"}), 400
                 if not new_password or len(new_password) < 6:
                     return jsonify({"success": False, "error": "La contraseña debe tener al menos 6 caracteres"}), 400
-                if not self.db:
-                    return jsonify({"success": False, "error": "Base de datos no conectada"}), 500
+                # CHANGE: 云端优先用 PostgreSQL
+                if self._use_pg_for_users():
+                    if not self._get_pg_config():
+                        return jsonify({"success": False, "error": "Base de datos no conectada"}), 500
+                else:
+                    if not self.db:
+                        return jsonify({"success": False, "error": "Base de datos no conectada"}), 500
                 token_hash = hashlib.sha256(token.encode()).hexdigest()
-                user = self.db.get_user_by_reset_token(token_hash)
+                if self._use_pg_for_users():
+                    user = self._pg_get_user_by_reset_token(token_hash)
+                else:
+                    user = self.db.get_user_by_reset_token(token_hash)
                 if not user:
                     return jsonify({"success": False, "error": "Enlace inválido o expirado"}), 400
                 password_hash = self._hash_password(new_password)
-                if not self.db.update_password_and_clear_reset(user['id'], password_hash):
+                if self._use_pg_for_users():
+                    ok = self._pg_update_password_and_clear_reset(user['id'], password_hash)
+                else:
+                    ok = self.db.update_password_and_clear_reset(user['id'], password_hash)
+                if not ok:
                     return jsonify({"success": False, "error": "Error al actualizar la contraseña"}), 500
                 return jsonify({"success": True, "message": "Contraseña restablecida correctamente"}), 200
             except Exception as e:
@@ -1690,6 +2055,10 @@ class PWACartAPIServer:
                 return jsonify({"success": False, "error": str(e)}), 500
         
         @self.app.route('/api/products', methods=['GET'])
+        @_cached_api_response(
+            lambda r: f"products_{r.args.get('supplier') or ''}_{r.args.get('search') or ''}_{r.args.get('page',1)}_{r.args.get('limit',30)}",
+            _API_CACHE_TTL_PRODUCTS
+        )
         def get_products():
             """获取产品列表 - 按新到旧排序，只显示激活的产品"""
             category = request.args.get('category', None)
@@ -1740,20 +2109,45 @@ class PWACartAPIServer:
                 )
                 
                 # CHANGE: 有搜索关键词时，强制使用 ULTIMO+PRODUCTOS 并集，实现跨两页搜索
+                # CHANGE: 按 product_code（规范化：去 ._AI 后缀、小写）去重，避免同一产品多供应商/多渠道重复
+                def _norm_code(pid, pinfo):
+                    code = (pinfo.get('product_code') or pinfo.get('codigo_producto') or '').strip()
+                    raw = code or str(pid or '').strip()
+                    if not raw:
+                        return raw
+                    return re.sub(r'\._A[Ii]\s*$', '', raw, flags=re.IGNORECASE).strip().lower() or raw.lower()
                 if search and str(search).strip():
+                    # CHANGE: 搜索时包含所有产品（绕过日期过滤），确保按产品代码可搜到任意产品
                     seen_search = set()
                     combined_search = []
                     for pid, pinfo in cristy_products:
-                        seen_search.add(pid)
-                        combined_search.append((pid, pinfo))
+                        key = _norm_code(pid, pinfo) or str(pid)
+                        if key not in seen_search:
+                            seen_search.add(key)
+                            combined_search.append((pid, pinfo))
                     for pid, pinfo in all_filtered_products:
-                        if pid not in seen_search:
-                            seen_search.add(pid)
+                        key = _norm_code(pid, pinfo) or str(pid)
+                        if key not in seen_search:
+                            seen_search.add(key)
+                            combined_search.append((pid, pinfo))
+                    # NOTE: 补充被日期过滤掉的「其他供应商」产品，使按产品代码搜索能命中任意产品
+                    _whitelist = getattr(self, 'other_supplier_codes', None) or ['Importadora_Chinito', 'IMP158', 'Importadorawoni', 'ayacuchoamoreshop', 'ecuarticulos']
+                    for pid, pinfo in products.items():
+                        if not pinfo.get('is_active', 1):
+                            continue
+                        cp = (pinfo.get('codigo_proveedor') or '').strip().lower()
+                        if cp == OWN_SUPPLIER_CODE.lower():
+                            continue
+                        if not cp or cp not in [c.lower() for c in _whitelist if c]:
+                            continue
+                        key = _norm_code(pid, pinfo) or str(pid)
+                        if key not in seen_search:
+                            seen_search.add(key)
                             combined_search.append((pid, pinfo))
                     combined_search.sort(key=lambda x: x[1].get('created_at', '') or '', reverse=True)
                     products_to_process = combined_search
-                    logger.info(f"🔍 [API] 搜索模式：使用 ULTIMO+PRODUCTOS 并集共 {len(products_to_process)} 个产品进行搜索")
-                    print(f"🔍 [API] 搜索模式：使用 ULTIMO+PRODUCTOS 并集共 {len(products_to_process)} 个产品进行搜索")
+                    logger.info(f"🔍 [API] 搜索模式：使用全量产品并集共 {len(products_to_process)} 个产品进行搜索（含被日期过滤的）")
+                    print(f"🔍 [API] 搜索模式：使用全量产品并集共 {len(products_to_process)} 个产品进行搜索")
                 
                 # CHANGE: 图片文件名从可配置目录（port_config.json pwa_cart.product_image_dirs）递归收集，与 serve_product_image 一致
                 import re
@@ -2171,37 +2565,44 @@ class PWACartAPIServer:
                 for product_id, product_info in products_to_process:
                     if category and product_info.get('category_id') != category:
                         continue
-                    # CHANGE: 只搜索 nombre_producto 与 descripcion，大小写不敏感，模糊匹配收紧
+                    # CHANGE: 只搜索 nombre_producto、descripcion、product_code，大小写不敏感，模糊匹配收紧
                     if search:
                         q_raw = str(search).strip().lower()
                         keywords = [k.strip() for k in q_raw.split() if k.strip()]
                         if not keywords:
                             continue
-                        # 大小写不敏感：统一转小写
+                        # 大小写不敏感：统一转小写；CHANGE: 增加 product_code、codigo、product_id 支持产品代码搜索
                         name_s = (product_info.get('name') or product_info.get('nombre_producto') or '').lower()
                         desc_s = (product_info.get('description') or product_info.get('descripcion') or '').lower()
-                        searchable_parts = [name_s, desc_s]
-                        searchable_text = ' '.join(p for p in searchable_parts if p)
-                        all_match = True
-                        for kw in keywords:
-                            if kw in searchable_text:
-                                continue
-                            # 模糊匹配收紧：相似度 >= 0.85，避免 RADIO 匹配到 ROSADO 等无关词
-                            fuzzy_ok = False
-                            for part in searchable_parts:
-                                if not part:
+                        code_s = (product_info.get('product_code') or product_info.get('codigo_producto') or product_info.get('codigo') or product_info.get('id') or product_id)
+                        code_s = (str(code_s) if code_s is not None else '').strip().lower()
+                        pid_s = (str(product_id) if product_id is not None else '').strip().lower()
+                        # NOTE: 产品代码精确匹配（忽略大小写）- 搜索词与 product_code 或 product_id 完全一致时直接命中
+                        if q_raw == code_s or q_raw == pid_s:
+                            all_match = True
+                        else:
+                            searchable_parts = [name_s, desc_s, code_s, pid_s]
+                            searchable_text = ' '.join(p for p in searchable_parts if p)
+                            all_match = True
+                            for kw in keywords:
+                                if kw in searchable_text:
                                     continue
-                                for word in re.split(r'[\s\-_.,;:]+', part):
-                                    if len(word) < 2:
+                                # 模糊匹配收紧：相似度 >= 0.85，避免 RADIO 匹配到 ROSADO 等无关词
+                                fuzzy_ok = False
+                                for part in searchable_parts:
+                                    if not part:
                                         continue
-                                    if difflib.SequenceMatcher(None, kw, word).ratio() >= 0.85:
-                                        fuzzy_ok = True
+                                    for word in re.split(r'[\s\-_.,;:]+', part):
+                                        if len(word) < 2:
+                                            continue
+                                        if difflib.SequenceMatcher(None, kw, word).ratio() >= 0.85:
+                                            fuzzy_ok = True
+                                            break
+                                    if fuzzy_ok:
                                         break
-                                if fuzzy_ok:
+                                if not fuzzy_ok:
+                                    all_match = False
                                     break
-                            if not fuzzy_ok:
-                                all_match = False
-                                break
                         if not all_match:
                             continue
                     created_at = product_info.get('created_at', '')
@@ -2236,6 +2637,9 @@ class PWACartAPIServer:
                     elif image_path and not image_path.startswith('http'):
                         image_path = f'/api/images/{_normalize_image_filename(image_path)}'
                     resolved = resolve_image_for_product(product_id, image_path)
+                    if not resolved and image_path and (image_path.startswith('/api/images/') or image_path.startswith('http')):
+                        # CHANGE: 搜索时若 resolve 失败但已有有效路径（云端图或 /api/images/），仍保留产品，避免按代码搜索无结果
+                        resolved = image_path if image_path.startswith('http') else image_path
                     if not resolved:
                         continue  # 图片不在 D:\Ya Subio 内，不显示该产品
                     filtered_with_image.append((product_id, product_info, created_at, resolved))
@@ -3287,6 +3691,12 @@ class PWACartAPIServer:
         @self.app.route('/api/payment/bank-info', methods=['GET'])
         def get_bank_info():
             """获取转账信息"""
+            # CHANGE: 银行信息缓存 5 分钟，减少重复请求
+            cache_key = 'bank_info'
+            if cache_key in _API_CACHE:
+                exp, data = _API_CACHE[cache_key]
+                if exp > time.time():
+                    return jsonify(data)
             try:
                 # CHANGE: 使用全局常量，确保链接正确
                 TELEGRAM_LINK = TELEGRAM_CUSTOMER_SERVICE_LINK
@@ -3366,6 +3776,7 @@ class PWACartAPIServer:
                 response = jsonify(final_data)
                 # 在响应头中添加验证信息
                 response.headers['X-Telegram-Link'] = TELEGRAM_LINK
+                _API_CACHE[cache_key] = (time.time() + _API_CACHE_TTL_BANK, final_data)
                 return response
                 
             except Exception as e:
