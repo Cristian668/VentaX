@@ -2150,7 +2150,7 @@ class PWACartAPIServer:
                     print(f"🔍 [API] 搜索模式：使用全量产品并集共 {len(products_to_process)} 个产品进行搜索")
                 
                 # CHANGE: 图片文件名从可配置目录（port_config.json pwa_cart.product_image_dirs）递归收集，与 serve_product_image 一致
-                import re
+                # NOTE: re 已在文件顶部 import，此处不再 import 避免 _norm_code 等闭包在 import 前被调用时报错
                 def _list_image_files_recursive(root_dir, max_depth=10, _depth=0):
                     """递归收集 root_dir 及其子文件夹内的图片文件名（仅 basename）"""
                     if _depth >= max_depth:
