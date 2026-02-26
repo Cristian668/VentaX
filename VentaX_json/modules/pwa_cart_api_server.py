@@ -933,19 +933,42 @@ class PWACartAPIServer:
             if not conn:
                 return []
             cur = conn.cursor(cursor_factory=RealDictCursor)
-            cur.execute(
-                """
-                SELECT id_producto, codigo_producto, nombre_producto, descripcion,
-                       precio_unidad, precio_mayor, precio_bulto, categoria, ruta_imagen,
-                       codigo_proveedor, fecha_creacion, esta_activo
-                FROM products
-                WHERE (codigo_proveedor IS NULL OR codigo_proveedor != 'Cristy')
-                  AND (esta_activo IS NULL OR esta_activo = TRUE)
-                  AND codigo_proveedor IS NOT NULL AND codigo_proveedor != ''
-                ORDER BY fecha_creacion DESC NULLS LAST
-                """
-            )
-            rows = cur.fetchall()
+            # CHANGE: codigo_proveedor 可能为空，用 channel_username 判断；若 channel_username 列不存在则回退原查询
+            try:
+                cur.execute(
+                    """
+                    SELECT id_producto, codigo_producto, nombre_producto, descripcion,
+                           precio_unidad, precio_mayor, precio_bulto, categoria, ruta_imagen,
+                           codigo_proveedor, channel_username, fecha_creacion, esta_activo
+                    FROM products
+                    WHERE (esta_activo IS NULL OR esta_activo = TRUE)
+                      AND (
+                        (codigo_proveedor IS NOT NULL AND codigo_proveedor != '' AND codigo_proveedor != 'Cristy')
+                        OR (channel_username IS NOT NULL AND channel_username != '' AND LOWER(channel_username) NOT IN ('novedadescristy_gye', 'cristy'))
+                      )
+                    ORDER BY fecha_creacion DESC NULLS LAST
+                    """
+                )
+                rows = cur.fetchall()
+            except Exception as e:
+                err_msg = str(e).lower() if e else ''
+                if 'channel_username' in err_msg or 'column' in err_msg or 'does not exist' in err_msg:
+                    # CHANGE: 包含 codigo_proveedor=NULL 的产品，由 _filter 用 ruta_imagen 路径推断供应商
+                    cur.execute(
+                        """
+                        SELECT id_producto, codigo_producto, nombre_producto, descripcion,
+                               precio_unidad, precio_mayor, precio_bulto, categoria, ruta_imagen,
+                               codigo_proveedor, fecha_creacion, esta_activo
+                        FROM products
+                        WHERE (esta_activo IS NULL OR esta_activo = TRUE)
+                          AND (codigo_proveedor IS NULL OR codigo_proveedor = '' OR (codigo_proveedor IS NOT NULL AND codigo_proveedor != 'Cristy'))
+                        ORDER BY fecha_creacion DESC NULLS LAST
+                        """
+                    )
+                    rows = cur.fetchall()
+                    logger.info(f"📦 [API] channel_username 列不存在，使用原查询: {len(rows)} 条")
+                else:
+                    raise
             cur.close()
             out = []
             for r in rows:
@@ -962,6 +985,7 @@ class PWACartAPIServer:
                 ruta = self._format_image_path(str(_r.get('ruta_imagen') or ''), (_r.get('codigo_proveedor') or '').strip())
                 _name = _r.get('nombre_producto')
                 _code = _r.get('codigo_producto')
+                _ruta_raw = str(_r.get('ruta_imagen') or '').strip()
                 pinfo = {
                     'name': (_name if _name is not None else '').strip() if isinstance(_name, str) else str(_name or ''),
                     'product_code': (_code if _code is not None else '').strip() if isinstance(_code, str) else str(_code or ''),
@@ -972,7 +996,9 @@ class PWACartAPIServer:
                     'category_id': (str(_r.get('categoria') or 'default')).strip(),
                     'image_path': ruta,
                     'ruta_imagen': ruta,
+                    'ruta_imagen_raw': _ruta_raw,  # CHANGE: 保留原始路径，供云端 fallback 提取 output_images 子目录
                     'codigo_proveedor': (_r.get('codigo_proveedor') or '').strip(),
+                    'channel_username': (_r.get('channel_username') or '').strip(),
                     'created_at': created_at or '',
                     'is_active': 1,
                 }
@@ -1226,7 +1252,7 @@ class PWACartAPIServer:
         self,
         products: Dict,
         cristy_from_pg: List[Tuple[Any, Dict]],
-        one_month_ago: datetime,
+        one_month_ago: Optional[datetime] = None,  # CHANGE: 已弃用，PRODUCTOS 不再按日期过滤
         own_supplier: str = 'Cristy',
     ) -> Tuple[List[Tuple[Any, Dict]], List[Tuple[Any, Dict]], int, int]:
         """筛选 Cristy 与其它供应商产品。返回 (cristy_products, all_filtered_products, skipped_by_date, skipped_cristy_by_stock)"""
@@ -1265,28 +1291,21 @@ class PWACartAPIServer:
                     continue
                 cristy_products.append((pid, pinfo))
                 continue
-            if not cp or cp not in [c.lower() for c in whitelist if c]:
-                continue
-            should_skip = False
-            ca = pinfo.get('created_at', '')
-            if ca:
-                try:
-                    dt = None
-                    if 'T' in ca:
-                        s = ca.replace('Z', '').split('+')[0]
-                        try:
-                            dt = datetime.fromisoformat(s)
-                        except (ValueError, AttributeError):
-                            s2 = s.split('.')[0] if '.' in s else s
-                            dt = datetime.strptime(s2, '%Y-%m-%dT%H:%M:%S')
-                    else:
-                        dt = datetime.strptime(ca, '%Y-%m-%d %H:%M:%S')
-                    if dt and dt < one_month_ago:
-                        skipped_by_date += 1
-                        should_skip = True
-                except Exception:
-                    pass
-            if should_skip:
+            # CHANGE: codigo_proveedor 可能为空，用 channel_username 回退匹配（如 Importadora_Chinito）
+            chan = (pinfo.get('channel_username') or '').strip().lower().lstrip('@')
+            cp_match = cp and cp in [c.lower() for c in whitelist if c]
+            chan_match = chan and chan in [c.lower() for c in whitelist if c]
+            # CHANGE: 两者都空时，用 ruta_imagen 路径推断（如 output_images/Importadora_Chinito/xxx.jpg）
+            path_match = False
+            if not cp_match and not chan_match:
+                _ruta = (pinfo.get('ruta_imagen_raw') or pinfo.get('ruta_imagen') or pinfo.get('image_path') or '')
+                if _ruta and isinstance(_ruta, str):
+                    _ruta_lower = _ruta.replace('\\', '/').lower()
+                    for _w in whitelist:
+                        if _w and _w.lower() in _ruta_lower:
+                            path_match = True
+                            break
+            if not cp_match and not chan_match and not path_match:
                 continue
             all_filtered.append((pid, pinfo))
         return cristy_products, all_filtered, skipped_by_date, skipped_cristy
@@ -2086,20 +2105,15 @@ class PWACartAPIServer:
                 # CHANGE: 自家产品标识 - 使用 codigo_proveedor = 'Cristy'
                 OWN_SUPPLIER_CODE = 'Cristy'
                 
-                # CHANGE: 计算一个月前的日期（用于过滤旧产品）
-                one_month_ago = datetime.now() - timedelta(days=30)
-                logger.info(f"📅 [API] 一个月前日期: {one_month_ago}, 当前日期: {datetime.now()}")
-                print(f"📅 [API] 一个月前日期: {one_month_ago}, 当前日期: {datetime.now()}")
-                
-                # CHANGE: 抽取到 _filter_products_cristy_and_others 降低 get_products 复杂度
+                # CHANGE: 已移除 PRODUCTOS 日期过滤（日期应以图片上传之时起计，DB created_at 非图传时间）
                 cristy_from_pg = self._get_ultimo_products_from_postgres()
                 cristy_products, all_filtered_products, skipped_by_date, skipped_cristy_by_stock = self._filter_products_cristy_and_others(
-                    products, cristy_from_pg, one_month_ago, OWN_SUPPLIER_CODE
+                    products, cristy_from_pg, None, OWN_SUPPLIER_CODE
                 )
                 
                 # CHANGE: 根据 supplier 参数决定使用哪个产品列表（抽取到 _select_products_by_supplier 降低复杂度）
-                logger.info(f"📊 [API] 产品统计: 总产品={len(products)}, PRODUCTOS(其他/1月)={len(all_filtered_products)}, 被日期过滤={skipped_by_date}, ULTIMO(Cristy/库存>=6)={len(cristy_products)}, Cristy库存下架={skipped_cristy_by_stock}, supplier={supplier}")
-                print(f"📊 [API] 产品统计: 总产品={len(products)}, PRODUCTOS(其他/1月)={len(all_filtered_products)}, 被日期过滤={skipped_by_date}, ULTIMO(Cristy/库存>=6)={len(cristy_products)}, Cristy库存下架={skipped_cristy_by_stock}, supplier={supplier}")
+                logger.info(f"📊 [API] 产品统计: 总产品={len(products)}, PRODUCTOS(其他)={len(all_filtered_products)}, ULTIMO(Cristy/库存>=6)={len(cristy_products)}, Cristy库存下架={skipped_cristy_by_stock}, supplier={supplier}")
+                print(f"📊 [API] 产品统计: 总产品={len(products)}, PRODUCTOS(其他)={len(all_filtered_products)}, ULTIMO(Cristy)={len(cristy_products)}, supplier={supplier}")
                 if len(all_filtered_products) > 0:
                     sample_providers = [pinfo.get('codigo_proveedor', 'NULL') for _, pinfo in all_filtered_products[:3]]
                     print(f"🔍 [API] 前3个产品的 codigo_proveedor: {sample_providers}")
@@ -2237,15 +2251,15 @@ class PWACartAPIServer:
                     logger.info(f"📷 [API] ULTIMO 使用 D:\\Ya Subio\\Cristy: 共 {len(_files_cristy)} 张图")
                     print(f"📷 [API] ULTIMO 使用 Cristy 目录: 共 {len(_files_cristy)} 张图")
                 elif supplier == 'others':
-                    logger.info(f"📷 [API] PRODUCTOS 仅 D:\\Ya Subio（排除 Cristy）: 共 {len(_files_ya_subio_only)} 张图（不含 product_images/output_images）")
-                    print(f"📷 [API] PRODUCTOS 仅 D:\\Ya Subio（排除 Cristy）: 共 {len(_files_ya_subio_only)} 张图")
+                    logger.info(f"📷 [API] PRODUCTOS 使用非Cristy图（Ya Subio+product_images+output_images）: 共 {len(_files_ya_subio_no_cristy)} 张图")
+                    print(f"📷 [API] PRODUCTOS 使用非Cristy图: 共 {len(_files_ya_subio_no_cristy)} 张图")
                 else:
                     logger.info(f"📷 [API] 图片目录 D:\\Ya Subio 全量: 共 {len(_files_ya_subio_merged)} 张图")
                     print(f"📷 [API] 图片目录: 共 {len(_files_ya_subio_merged)} 张图")
                 # 过滤与解析统一用并集：只显示「D:\Ya Subio 或 D:\Ya Subio\Cristy 内有对应图片」的产品
                 _files_ya_subio = _files_ya_subio_merged
-                # CHANGE: supplier=others 时仅用 D:\Ya Subio（排除 Cristy）的图匹配，严格「以 DB 为主 + 图在 D:\Ya Subio」
-                _files_for_resolve = _files_ya_subio_only if supplier_lower == 'others' else _files_ya_subio
+                # CHANGE: supplier=others 时用 _files_ya_subio_no_cristy（含 Ya Subio + product_images + output_images），使 PRODUCTOS 能显示其他供应商产品图
+                _files_for_resolve = _files_ya_subio_no_cristy if supplier_lower == 'others' else _files_ya_subio
                 if not _files_ya_subio and _processed_dir:
                     logger.warning(f"⚠️ [API] 可配置图片目录下未扫到任何图片，请检查路径与权限: {_processed_dir}, {_cristy_subdir}")
                     print(f"⚠️ [API] 可配置图片目录下未扫到任何图片，请检查路径与权限: {_processed_dir}, {_cristy_subdir}")
@@ -2345,10 +2359,10 @@ class PWACartAPIServer:
                     resp.headers['Pragma'] = 'no-cache'
                     resp.headers['X-Image-Logic'] = 'cristy-image-first'
                     return resp
-                # CHANGE: PRODUCTOS(supplier=others) 仅按「产品图片名称」查找映射：用全库 products 的 ruta_imagen 建 文件名->产品，保证每张图对应 DB 中该图名的产品数据
-                # 仅用 D:\Ya Subio（排除 Cristy）：按 三脚本图片保存读取路径一览.md，上传 Telegram 后处理图已移至 D:\Ya Subio
+                # CHANGE: PRODUCTOS(supplier=others) 按「产品图片名称」查找映射：用全库 products 的 ruta_imagen 建 文件名->产品
+                # 使用 _files_ya_subio_no_cristy（含 Ya Subio + product_images + output_images），使新上传产品图能显示
                 # CHANGE: 有 search 时跳过「以图为准」分支，强制走 filtered_with_meta 确保搜索过滤
-                if not _skip_image_first and supplier_lower == 'others' and len(_files_ya_subio_only) > 0:
+                if not _skip_image_first and supplier_lower == 'others' and len(_files_ya_subio_no_cristy) > 0:
                     # CHANGE: 合并 PostgreSQL 非Cristy 产品，避免仅存 PG 的产品（如 id_producto 1677/1678）无法映射
                     _pg_others = self._get_others_products_from_postgres()
                     for _pid, _pinfo in _pg_others:
@@ -2380,7 +2394,7 @@ class PWACartAPIServer:
                         if _key_raw not in _image_to_product:
                             _image_to_product[_key_raw] = (_pid, _pinfo)
                     _image_first_others = []
-                    for _f in _files_ya_subio_only:
+                    for _f in _files_ya_subio_no_cristy:
                         _base = os.path.splitext(_f)[0].strip()
                         _fn_norm = _normalize_image_filename(_f)
                         _pair = None
@@ -2640,6 +2654,33 @@ class PWACartAPIServer:
                     if not resolved and image_path and (image_path.startswith('/api/images/') or image_path.startswith('http')):
                         # CHANGE: 搜索时若 resolve 失败但已有有效路径（云端图或 /api/images/），仍保留产品，避免按代码搜索无结果
                         resolved = image_path if image_path.startswith('http') else image_path
+                    # CHANGE: 云端 Render 无本地图片目录时，以 DB 为主：用 PAGES_IMAGE_BASE_URL 构造图片 URL，避免产品被过滤
+                    if not resolved and not _files_for_resolve:
+                        pages_base = getattr(self, 'pages_image_base_url', None) or (os.getenv('PAGES_IMAGE_BASE_URL', '') or '').strip().rstrip('/')
+                        if pages_base:
+                            _img = product_info.get('ruta_imagen_raw') or product_info.get('image_path') or product_info.get('ruta_imagen') or image_path or ''
+                            if _img and isinstance(_img, str):
+                                _norm = _img.replace('\\', '/').strip()
+                                if _img.startswith('/api/images/'):
+                                    _rel = _normalize_image_filename(_img.replace('/api/images/', '').split('?')[0].strip())
+                                elif 'output_images' in _norm.lower() or 'product_images' in _norm.lower():
+                                    # 保留相对路径，如 .../output_images/Importadora_Chinito/xxx.jpg -> Importadora_Chinito/xxx.jpg
+                                    _lower = _norm.lower()
+                                    for _key in ('output_images/', 'product_images/'):
+                                        if _key in _lower:
+                                            _rel = _norm[_lower.index(_key) + len(_key):].replace(' ', '%20')
+                                            _rel = _normalize_image_filename(_rel)
+                                            break
+                                    else:
+                                        _rel = _normalize_image_filename(os.path.basename(_norm))
+                                else:
+                                    _rel = _normalize_image_filename(os.path.basename(_norm))
+                                if _rel and _rel.lower().endswith(('.jpg', '.jpeg', '.png', '.gif', '.webp')):
+                                    _sub = 'Cristy/' if (product_info.get('codigo_proveedor') or '').strip().lower() == 'cristy' else ''
+                                    resolved = pages_base + '/Ya%20Subio/' + _sub + _rel
+                    # CHANGE: 云端无本地图时，即使 resolve 失败也保留产品（传 image_path 或空），前端会显示 Sin imagen，避免 180 产品只显示 4 个
+                    if not resolved and not _files_for_resolve and image_path:
+                        resolved = image_path  # 保留 /api/images/xxx 供前端尝试加载
                     if not resolved:
                         continue  # 图片不在 D:\Ya Subio 内，不显示该产品
                     filtered_with_image.append((product_id, product_info, created_at, resolved))
