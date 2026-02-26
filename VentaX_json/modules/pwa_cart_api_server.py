@@ -371,23 +371,50 @@ class PWACartAPIServer:
             # CHANGE: 所有响应（含 4xx/5xx）都加 CORS，避免 Render 错误响应无头导致浏览器报 CORS
             _cors_origins_set = set(_cors_origins)
 
+            # CHANGE: 最先处理 OPTIONS 预检，确保 CORS 预检成功；放宽 origin 匹配以支持 Cloudflare Pages
+            @self.app.before_request
+            def cors_options_preflight():
+                if request.method != 'OPTIONS':
+                    return None
+                origin = request.environ.get('HTTP_ORIGIN') or request.headers.get('Origin')
+                # ventax.pages.dev、*.ventax.pages.dev、ventaxpages.com 及本地
+                allow = origin and (
+                    origin in _cors_origins_set
+                    or re.match(r'^https://([a-z0-9-]+\.)*ventax\.pages\.dev$', origin)
+                    or re.match(r'^https://([a-z0-9-]+\.)*ventaxpages\.com$', origin)
+                )
+                resp = jsonify({'ok': True})
+                if allow:
+                    resp.headers['Access-Control-Allow-Origin'] = origin
+                    resp.headers['Access-Control-Allow-Credentials'] = 'true'
+                    resp.headers['Access-Control-Allow-Methods'] = 'GET, POST, PUT, PATCH, DELETE, OPTIONS'
+                    resp.headers['Access-Control-Allow-Headers'] = 'Content-Type, Authorization, X-Session-Id'
+                    resp.headers['Access-Control-Max-Age'] = '86400'
+                    return resp
+                # 未知 origin 时仍返回 CORS 头，避免预检失败掩盖真实问题（实际响应由 after_request 控制）
+                if origin:
+                    resp.headers['Access-Control-Allow-Origin'] = origin
+                    resp.headers['Access-Control-Allow-Methods'] = 'GET, POST, PUT, PATCH, DELETE, OPTIONS'
+                    resp.headers['Access-Control-Allow-Headers'] = 'Content-Type, Authorization, X-Session-Id'
+                return resp
+
             @self.app.after_request
             def cors_ventax_pages_preview(response):
                 origin = request.environ.get('HTTP_ORIGIN') or request.headers.get('Origin')
                 if not origin:
                     return response
-                allow = False
-                if origin in _cors_origins_set:
-                    allow = True
-                elif re.match(r'^https://[a-z0-9-]+\.ventax\.pages\.dev$', origin):
-                    allow = True
+                allow = (
+                    origin in _cors_origins_set
+                    or re.match(r'^https://([a-z0-9-]+\.)*ventax\.pages\.dev$', origin)
+                    or re.match(r'^https://([a-z0-9-]+\.)*ventaxpages\.com$', origin)
+                )
                 if allow:
                     response.headers['Access-Control-Allow-Origin'] = origin
                     response.headers['Access-Control-Allow-Credentials'] = 'true'
                     response.headers['Access-Control-Expose-Headers'] = 'Content-Type'
                     if request.method == 'OPTIONS':
                         response.headers['Access-Control-Allow-Methods'] = 'GET, POST, PUT, PATCH, DELETE, OPTIONS'
-                        response.headers['Access-Control-Allow-Headers'] = 'Content-Type, Authorization'
+                        response.headers['Access-Control-Allow-Headers'] = 'Content-Type, Authorization, X-Session-Id'
                 return response
             
             # CHANGE: /pwa_cart/api/* 重写为 /api/*，便于前端在 /pwa_cart/ 页时统一用 /pwa_cart/api 避免 404（如反向代理只转发 /pwa_cart 时）
@@ -398,26 +425,26 @@ class PWACartAPIServer:
                     request.environ['PATH_INFO'] = new_path
                     logger.debug(f"📌 重写 PATH_INFO: {request.path} -> {new_path}")
 
-            # CHANGE: 添加认证中间件
+            # CHANGE: 添加认证中间件（无登录模式：优先用 session_id 作为 guest_id，不再强制登录）
             @self.app.before_request
             def authenticate_request():
-                """从请求头中提取token并验证用户"""
-                # 跳过认证相关的路由
+                """从请求头提取 token 或 X-Session-Id；无登录时用 session_id 转为 guest_id"""
                 if request.path.startswith('/api/auth/'):
                     return
-                
-                # 尝试从请求头获取token
                 auth_header = request.headers.get('Authorization')
                 if auth_header and auth_header.startswith('Bearer '):
-                    token = auth_header[7:]  # 移除 'Bearer ' 前缀
+                    token = auth_header[7:]
                     payload = self._verify_token(token)
                     if payload:
-                        # 将用户信息添加到request对象（使用setattr避免类型检查错误）
                         setattr(request, 'user_id', payload.get('user_id'))
                         setattr(request, 'user_email', payload.get('email'))
-                    else:
-                        setattr(request, 'user_id', None)
-                        setattr(request, 'user_email', None)
+                        return
+                # CHANGE: 无 token 时用 X-Session-Id 转为 guest_id，实现免登录购物车/下单
+                session_id = request.headers.get('X-Session-Id', '').strip()
+                if session_id:
+                    guest_id = self._session_to_guest_id(session_id)
+                    setattr(request, 'user_id', guest_id)
+                    setattr(request, 'user_email', None)
                 else:
                     setattr(request, 'user_id', None)
                     setattr(request, 'user_email', None)
@@ -535,6 +562,13 @@ class PWACartAPIServer:
     def _verify_password(self, password, password_hash):
         """验证密码"""
         return self._hash_password(password) == password_hash
+
+    def _session_to_guest_id(self, session_id: str) -> int:
+        """CHANGE: 将 session_id 转为负整数 guest_id，用于无登录模式下的购物车/订单"""
+        if not session_id or not isinstance(session_id, str):
+            return 0
+        h = int(hashlib.sha256(session_id.strip().encode()).hexdigest()[:8], 16)
+        return -abs(h % 99999999)
 
     # CHANGE: 云端用户存储 - 当 DATABASE_URL 存在时，用户数据写入 PostgreSQL（Neon），避免 Render 冷启动后 SQLite 重置导致用户丢失
     def _use_pg_for_users(self) -> bool:
@@ -1362,7 +1396,10 @@ class PWACartAPIServer:
             pg_cfg = self._get_pg_config()
             if pg_cfg:
                 self._ensure_pwa_users_table(pg_cfg)
-        
+                logger.info("✅ DATABASE_URL 已配置，用户数据将写入 PostgreSQL (pwa_users)")
+        else:
+            logger.warning("⚠️ DATABASE_URL 未配置！用户数据将使用 SQLite，Render 冷启动后丢失。请在 Render 环境变量中设置 DATABASE_URL（Neon 连接串）")
+
         @self.app.route('/health')
         def health():
             """CHANGE: 轻量健康检查，供 Render/UptimeRobot 快速 ping，避免 No open HTTP ports"""
@@ -1747,6 +1784,30 @@ class PWACartAPIServer:
             return jsonify({"success": False, "error": msg}), 500
         
         # CHANGE: 用户注册和登录API
+        @self.app.route('/api/auth/db-status', methods=['GET'])
+        def auth_db_status():
+            """诊断：检查用户数据库连接状态（PostgreSQL vs SQLite）"""
+            pg_ok = self._use_pg_for_users()
+            user_count = 0
+            if pg_ok:
+                try:
+                    pg_cfg = self._get_pg_config()
+                    if pg_cfg and PSYCOPG2_AVAILABLE:
+                        conn = self._pg_connect(pg_cfg)
+                        if conn:
+                            cur = conn.cursor()
+                            cur.execute("SELECT COUNT(*) FROM pwa_users")
+                            user_count = cur.fetchone()[0] or 0
+                            cur.close()
+                            conn.close()
+                except Exception as e:
+                    logger.warning(f"db-status 查询失败: {e}")
+            return jsonify({
+                "postgresql_configured": pg_ok,
+                "pwa_users_count": user_count,
+                "message": "PostgreSQL conectado" if pg_ok else "DATABASE_URL no configurado. Los usuarios se guardan en SQLite (se pierden al reiniciar)."
+            }), 200
+
         @self.app.route('/api/auth/register', methods=['POST'])
         def register():
             """用户注册 - 邮箱注册"""
@@ -2966,9 +3027,9 @@ class PWACartAPIServer:
                 if hasattr(request, 'user_id') and getattr(request, 'user_id', None):
                     user_id = getattr(request, 'user_id', None)
                     logger.info(f"📥 API获取购物车请求: 从token获取user_id={user_id}")
-                # 无 token 时不再从 request.args 读取 user_id，直接返回空购物车
-                if not user_id or user_id <= 0:
-                    logger.info("📥 API获取购物车请求: 无user_id，返回空购物车")
+                # CHANGE: 允许 guest_id（负整数），仅 user_id 为 None 或 0 时返回空购物车
+                if user_id is None or user_id == 0:
+                    logger.info("📥 API获取购物车请求: 无user_id/session_id，返回空购物车")
                     return jsonify({
                         "success": True,
                         "data": []
@@ -3109,10 +3170,10 @@ class PWACartAPIServer:
                 if not data:
                     return jsonify({"error": "El cuerpo de la solicitud está vacío"}), 400
                 
-                # CHANGE: 仅从认证token获取user_id，未登录禁止操作购物车
+                # CHANGE: 支持 guest_id（session_id 转为负整数），无 session 时禁止操作
                 user_id = getattr(request, 'user_id', None) if hasattr(request, 'user_id') else None
-                if not user_id or user_id <= 0:
-                    return jsonify({"error": "Inicie sesión primero", "require_login": True}), 401
+                if user_id is None or user_id == 0:
+                    return jsonify({"error": "Recargue la página e intente de nuevo"}), 400
                 
                 product_id = data.get('product_id')
                 quantity = data.get('quantity', 1)
@@ -3170,8 +3231,8 @@ class PWACartAPIServer:
                 if not data:
                     return jsonify({"error": "El cuerpo de la solicitud está vacío"}), 400
                 user_id = getattr(request, 'user_id', None) if hasattr(request, 'user_id') else None
-                if not user_id or user_id <= 0:
-                    return jsonify({"error": "Inicie sesión primero", "require_login": True}), 401
+                if user_id is None or user_id == 0:
+                    return jsonify({"error": "Recargue la página e intente de nuevo"}), 400
                 product_id = data.get('product_id')
                 quantity = data.get('quantity')
                 unit_price = data.get('price')
@@ -3209,8 +3270,8 @@ class PWACartAPIServer:
                 if not data:
                     return jsonify({"error": "El cuerpo de la solicitud está vacío"}), 400
                 user_id = getattr(request, 'user_id', None) if hasattr(request, 'user_id') else None
-                if not user_id or user_id <= 0:
-                    return jsonify({"error": "Inicie sesión primero", "require_login": True}), 401
+                if user_id is None or user_id == 0:
+                    return jsonify({"error": "Recargue la página e intente de nuevo"}), 400
                 product_id = data.get('product_id')
                 if not product_id:
                     return jsonify({"error": "Faltan parámetros obligatorios"}), 400
@@ -3238,8 +3299,8 @@ class PWACartAPIServer:
             try:
                 data = request.get_json() or {}
                 user_id = getattr(request, 'user_id', None) if hasattr(request, 'user_id') else None
-                if not user_id or user_id <= 0:
-                    return jsonify({"error": "Inicie sesión primero", "require_login": True}), 401
+                if user_id is None or user_id == 0:
+                    return jsonify({"error": "Recargue la página e intente de nuevo"}), 400
                 
                 if not self.cart_manager:
                     return jsonify({"error": "Gestor del carrito no disponible"}), 500
@@ -3261,8 +3322,8 @@ class PWACartAPIServer:
             """计算购物车总价。仅信任JWT。"""
             try:
                 user_id = getattr(request, 'user_id', None) if hasattr(request, 'user_id') else None
-                if not user_id or user_id <= 0:
-                    return jsonify({"error": "Inicie sesión primero", "require_login": True}), 401
+                if user_id is None or user_id == 0:
+                    return jsonify({"error": "Recargue la página e intente de nuevo"}), 400
                 
                 if not self.cart_manager:
                     return jsonify({"error": "Gestor del carrito no disponible"}), 500
@@ -3296,9 +3357,9 @@ class PWACartAPIServer:
                 customer_info = data.get('customer_info', {})  # CHANGE: 获取客户信息
                 logger.info(f"📦 收到订单提交请求: user_id={user_id}, type={type(user_id)}")
                 logger.info(f"👤 客户信息: {json.dumps(customer_info, ensure_ascii=False) if customer_info else '无'}")
-                if not user_id or user_id <= 0:
+                if user_id is None or user_id == 0:
                     logger.error("❌ 未登录无法提交订单")
-                    return jsonify({"error": "Inicie sesión primero", "require_login": True}), 401
+                    return jsonify({"error": "Recargue la página e intente de nuevo"}), 400
                 # CHANGE: 验证客户信息
                 if not customer_info:
                     logger.error("❌ 缺少客户信息")
@@ -3621,8 +3682,8 @@ class PWACartAPIServer:
             """获取订单列表。仅信任JWT。"""
             try:
                 user_id = getattr(request, 'user_id', None) if hasattr(request, 'user_id') else None
-                if not user_id or user_id <= 0:
-                    return jsonify({"error": "Inicie sesión primero", "require_login": True}), 401
+                if user_id is None or user_id == 0:
+                    return jsonify({"error": "Recargue la página e intente de nuevo"}), 400
                 
                 if not self.db:
                     return jsonify({"error": "Base de datos no conectada"}), 500
@@ -3649,8 +3710,8 @@ class PWACartAPIServer:
             """获取订单详情。仅信任JWT。"""
             try:
                 user_id = getattr(request, 'user_id', None) if hasattr(request, 'user_id') else None
-                if not user_id or user_id <= 0:
-                    return jsonify({"error": "Inicie sesión primero", "require_login": True}), 401
+                if user_id is None or user_id == 0:
+                    return jsonify({"error": "Recargue la página e intente de nuevo"}), 400
                 if not self.db:
                     return jsonify({"error": "Base de datos no conectada"}), 500
                 

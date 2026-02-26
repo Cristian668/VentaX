@@ -2,7 +2,7 @@
 
 // ===== PWA Service Worker =====
 
-const CACHE_NAME = 'ventax-cart-v8';  // CHANGE: 升版，配合 index 静态资源路径修复（/pwa_cart/ 下 CSS/icon 不 404）
+const CACHE_NAME = 'ventax-cart-v11';  // CHANGE: v11 强制更新（CORS 修复后刷新）
 const STATIC_CACHE_URLS = [
     './',
     './index.html',
@@ -70,7 +70,12 @@ self.addEventListener('fetch', (event) => {
     const { request } = event;
     const url = new URL(request.url);
     
-    // CHANGE: API 请求不经过 SW，直接走网络，避免返回旧缓存导致产品代码/价格全部相同
+    // CHANGE: 跨域 API（如 onrender.com）不拦截，让浏览器原生处理，避免 SW 导致 CORS 预检异常
+    const isCrossOriginApi = url.hostname && (url.hostname.includes('onrender.com') || url.hostname.includes('render.com'));
+    if (isCrossOriginApi) {
+        return;  // 不调用 respondWith，浏览器直接处理
+    }
+    // 同源 API 直连网络
     if (url.pathname.startsWith('/api/') || url.pathname.startsWith('/pwa_cart/api/')) {
         event.respondWith(fetch(request));
         return;
@@ -136,19 +141,34 @@ self.addEventListener('fetch', (event) => {
         return;
     }
     
-    // 静态资源：缓存优先，失败时网络请求
-    // ⚠️ 只处理GET请求
+    // CHANGE: 产品图 network-first，避免 Android 缓存 404
+    const path = url.pathname || '';
+    const isProductImage = path.indexOf('Ya%20Subio') !== -1 || path.indexOf('Ya Subio') !== -1 ||
+        /\.(jpg|jpeg|png|gif|webp)(\?|$)/i.test(path);
     if (request.method !== 'GET') {
         event.respondWith(fetch(request));
+        return;
+    }
+    
+    if (isProductImage) {
+        event.respondWith(
+            fetch(request)
+                .then((response) => {
+                    if (response.status === 200 && canCacheUrl(request.url)) {
+                        const clone = response.clone();
+                        caches.open(CACHE_NAME).then((c) => c.put(request, clone).catch(() => {}));
+                    }
+                    return response;
+                })
+                .catch(() => caches.match(request))
+        );
         return;
     }
     
     event.respondWith(
         caches.match(request)
             .then((cachedResponse) => {
-                if (cachedResponse) {
-                    return cachedResponse;
-                }
+                if (cachedResponse) return cachedResponse;
                 return fetch(request).then((response) => {
                     // CHANGE: 只缓存成功的GET响应，且URL协议支持缓存
                     if (response.status === 200 && request.method === 'GET' && canCacheUrl(request.url)) {
