@@ -2,19 +2,16 @@
 <html lang="es">
 <head>
     <meta charset="UTF-8">
-    <!-- CHANGE: base 按实际 path 决定。仅 path 含 /pwa_cart 时用子目录，否则用 /，避免根路径部署时 /pwa_cart/config.js 与 manifest 404 -->
+    <!-- 强制从站点根加载 CSS，避免 /pwa_cart/#/ 下相对路径 404 导致黑白 -->
     <script>
-    (function(){
-      var o = location.origin;
-      var path = location.pathname || '';
-      var base = (path.indexOf('/pwa_cart') !== -1) ? (o + '/pwa_cart/') : (o + '/');
-      document.write('<base href="' + base + '">');
-      document.write('<link rel="stylesheet" href="' + base + 'styles.css?v=13">');
-      document.write('<link rel="icon" type="image/svg+xml" href="' + base + 'icon-192.svg">');
-      document.write('<link rel="manifest" href="' + base + 'manifest.json">');
-    })();
+      (function(){
+        var o = location.origin;
+        var link = document.createElement('link');
+        link.rel = 'stylesheet';
+        link.href = o + '/styles.css?v=13';
+        document.head.appendChild(link);
+      })();
     </script>
-    <!-- CHANGE: 老旧设备兼容 - 允许缩放便于阅读，触摸目标已≥44px -->
     <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=5.0, user-scalable=yes">
     <meta name="description" content="VentaX Carrito - Aplicación PWA">
     <meta name="theme-color" content="#4CAF50">
@@ -22,18 +19,25 @@
     <!-- 移除 unload=* 以避免权限策略违规 -->
     <title>VentaX Carrito</title>
     
-    <!-- CHANGE: Google Fonts 异步加载，不阻塞首屏渲染 -->
+    <!-- Favicon / Manifest：根路径 -->
+    <link rel="icon" type="image/svg+xml" href="/favicon.ico">
+    <link rel="manifest" href="/manifest.json">
+    
+    <!-- Google Fonts - 现代字体 -->
     <link rel="preconnect" href="https://fonts.googleapis.com">
     <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
-    <link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700;800&family=Poppins:wght@400;500;600;700;800&display=swap" media="print" onload="this.media='all'">
-    <noscript><link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700;800&family=Poppins:wght@400;500;600;700;800&display=swap"></noscript>
+    <link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700;800&family=Poppins:wght@400;500;600;700;800&display=swap" rel="stylesheet">
     
     <!-- iOS PWA支持 -->
     <!-- 使用新的标准，移除已弃用的 apple-mobile-web-app-capable -->
     <meta name="mobile-web-app-capable" content="yes">
     <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
     <meta name="apple-mobile-web-app-title" content="VentaX Carrito">
-    <!-- CHANGE: Lucide 改为 defer，不阻塞 HTML 解析 -->
+    
+    <!-- 样式已由顶部脚本注入（根路径），此处备用以防脚本未执行 -->
+    <link rel="stylesheet" href="/styles.css?v=9">
+    <!-- Lucide Icons CDN - 新一代图标库 (jsdelivr 备选) -->
+    <script src="https://cdn.jsdelivr.net/npm/lucide@0.460.0/dist/umd/lucide.min.js"></script>
 </head>
 <body>
     <!-- 背景装饰元素 -->
@@ -54,10 +58,6 @@
                     <button class="logout-btn" id="logoutBtn" title="Cerrar sesión"><i data-lucide="log-out"></i></button>
                 </div>
                 <button class="login-btn hidden" id="loginBtn">Iniciar Sesión</button>
-                <button class="add-to-home-btn" id="addToHomeBtn" type="button" title="Añadir a pantalla de inicio (como app)">
-                    <span class="add-to-home-icon"><i data-lucide="smartphone"></i></span>
-                    <span class="add-to-home-label">Añadir a pantalla</span>
-                </button>
                 <button class="cart-button" id="cartButton">
                     <span class="cart-icon"><i data-lucide="shopping-cart"></i></span>
                     <span class="cart-count" id="cartCount">0</span>
@@ -184,11 +184,11 @@
             <span class="nav-label">Pedidos</span>
         </button>
         <a class="nav-item nav-link" href="https://wa.me/593939962405" target="_blank" rel="noopener noreferrer" data-link="whatsapp">
-            <img src="assets/social-logos/whatsapp.png" alt="WhatsApp" class="nav-icon-img">
+            <img src="/assets/social-logos/whatsapp.png" alt="WhatsApp" class="nav-icon-img">
             <span class="nav-label">WhatsApp</span>
         </a>
         <a class="nav-item nav-link" href="https://t.me/NovedadesCristy_gye" target="_blank" rel="noopener noreferrer" data-link="telegram">
-            <img src="assets/social-logos/telegram.png" alt="Telegram" class="nav-icon-img">
+            <img src="/assets/social-logos/telegram.png" alt="Telegram" class="nav-icon-img">
             <span class="nav-label">Telegram</span>
         </a>
         <button class="nav-item" data-view="search" type="button" title="Buscar productos">
@@ -262,7 +262,6 @@
                             <label for="loginPassword">Contraseña</label>
                             <input type="password" id="loginPassword" name="password" required placeholder="••••••••">
                         </div>
-                        <!-- CHANGE: 错误提示放在按钮上方并提高层级，确保在弹窗内最前显示 -->
                         <div id="loginError" class="login-error hidden" role="alert" aria-live="polite"></div>
                         <button type="submit" class="btn btn-primary btn-block">Iniciar Sesión</button>
                         <div class="auth-forgot" style="margin-top: 0.5rem; text-align: center;">
@@ -338,37 +337,6 @@
         </div>
     </div>
 
-    <!-- 添加到主屏幕说明模态框（iOS/无安装提示时显示步骤） -->
-    <div class="modal-overlay hidden" id="addToHomeModal">
-        <div class="modal-content" style="max-width: 380px;">
-            <div class="modal-header">
-                <h3><i data-lucide="smartphone" class="modal-title-icon"></i> Añadir a pantalla de inicio</h3>
-                <button class="modal-close" id="addToHomeModalCloseBtn" aria-label="Cerrar">×</button>
-            </div>
-            <div class="modal-body" id="addToHomeModalBody">
-                <p style="margin-bottom: 1rem; color: var(--text-light); font-size: 0.95rem;">Sigue estos pasos para instalar la app en tu pantalla de inicio:</p>
-                <div id="addToHomeStepsIOS" class="add-to-home-steps hidden">
-                    <p><strong>En iPhone/iPad (Safari):</strong></p>
-                    <ol style="margin: 0.5rem 0 0 1.2rem; padding: 0; color: var(--text-color); line-height: 1.6;">
-                        <li>Pulsa el botón <strong>Compartir</strong> (icono de flecha hacia arriba, abajo o arriba).</li>
-                        <li>Desplázate y elige <strong>«Añadir a la pantalla de inicio»</strong>.</li>
-                        <li>Pulsa <strong>«Añadir»</strong>.</li>
-                    </ol>
-                </div>
-                <div id="addToHomeStepsAndroid" class="add-to-home-steps hidden">
-                    <p><strong>En Android (Chrome):</strong></p>
-                    <ol style="margin: 0.5rem 0 0 1.2rem; padding: 0; color: var(--text-color); line-height: 1.6;">
-                        <li>Abre el menú <strong>⋮</strong> (arriba a la derecha).</li>
-                        <li>Elige <strong>«Añadir a la pantalla de inicio»</strong> o <strong>«Instalar aplicación»</strong>.</li>
-                    </ol>
-                </div>
-                <div id="addToHomeStepsGeneric" class="add-to-home-steps">
-                    <p style="color: var(--text-light);">En el navegador, busca la opción <strong>«Añadir a la pantalla de inicio»</strong> o <strong>«Instalar»</strong> en el menú (⋮) o en ajustes.</p>
-                </div>
-            </div>
-        </div>
-    </div>
-
     <!-- 客户信息表单模态框 -->
     <div class="modal-overlay hidden" id="customerInfoModal">
         <div class="modal-content" style="max-width: 500px; max-height: 90vh; overflow-y: auto;">
@@ -418,10 +386,8 @@
         </div>
     </div>
 
-    <!-- CHANGE: Lucide defer 加载，与 app 并行不阻塞 -->
-    <script src="https://cdn.jsdelivr.net/npm/lucide@0.460.0/dist/umd/lucide.min.js" defer></script>
-    <!-- 脚本：相对路径确保 Pages 下 /pwa_cart/ 能加载到同目录的 config.js；版本号防缓存 -->
-    <script src="./config.js?v=10"></script>
-    <script src="./app.js?v=22"></script>
+    <!-- 脚本：根路径，/pwa_cart/#/ 下也能加载 -->
+    <script src="/config.js"></script>
+    <script src="/app.js?v=9"></script>
 </body>
 </html>

@@ -309,8 +309,17 @@ class PWACartAPIServer:
                 _codes = _pwa.get('other_supplier_codes')
                 if isinstance(_codes, list) and _codes:
                     self.other_supplier_codes = [str(c).strip() for c in _codes if str(c).strip()]
+                # CHANGE: 排除未完成处理的产品图片（如仅OCR未白底），避免 404 影响旧产品显示
+                _excl = _pwa.get('productos_exclude_file_prefixes')
+                self.productos_exclude_file_prefixes = [str(p).strip().lower() for p in _excl if str(p).strip()] if isinstance(_excl, list) else []
         except Exception as e:
             logger.warning(f"⚠️ 读取 port_config.json 图片路径失败: {e}")
+        if not getattr(self, 'productos_exclude_file_prefixes', None):
+            _env_excl = (os.getenv('PRODUCTOS_EXCLUDE_FILE_PREFIXES') or '').strip()
+            if _env_excl:
+                self.productos_exclude_file_prefixes = [p.strip().lower() for p in _env_excl.split(',') if p.strip()]
+            else:
+                self.productos_exclude_file_prefixes = ['importadorawoni_']  # 默认排除未完成白底处理的
         if not self.product_image_dirs and os.getenv('PWA_PRODUCT_IMAGE_DIRS'):
             self.product_image_dirs = [os.path.normpath(p.strip()) for p in os.getenv('PWA_PRODUCT_IMAGE_DIRS', '').split(',') if p.strip()]
         # CHANGE: 方案 A 云端部署时用 R2 或 Cloudflare Pages；图片 URL 指向云端，不需本机 /api/images/
@@ -339,6 +348,8 @@ class PWACartAPIServer:
         else:
             logger.info(f"📷 可配置图片目录（共 {len(self.product_image_dirs)} 个）: {self.product_image_dirs}")
         logger.info(f"📷 [API] PRODUCTOS 其他供应商白名单: {self.other_supplier_codes}")
+        if self.productos_exclude_file_prefixes:
+            logger.info(f"📷 [API] PRODUCTOS 排除文件前缀（未完成处理）: {self.productos_exclude_file_prefixes}")
         # CHANGE: 启动时加入 Telegram 同步图片目录，使 serve_product_image 能提供 telegram_xxx.jpg（否则 get_products 匹配到图但 /api/images/ 返回 404）
         _modules_dir = os.path.dirname(os.path.abspath(__file__))
         _telegram_product_images = os.path.normpath(os.path.abspath(os.path.join(_modules_dir, '..', 'database', 'product_images')))
@@ -1341,6 +1352,13 @@ class PWACartAPIServer:
                             break
             if not cp_match and not chan_match and not path_match:
                 continue
+            # CHANGE: 排除未完成处理的产品（如图片路径含 importadoraWoni_ 且仅OCR未白底）
+            _excl_prefixes = getattr(self, 'productos_exclude_file_prefixes', None) or []
+            if _excl_prefixes:
+                _img = (pinfo.get('ruta_imagen_raw') or pinfo.get('ruta_imagen') or pinfo.get('image_path') or '')
+                _img_base = os.path.basename(str(_img).replace('\\', '/')).lower() if _img else ''
+                if _img_base and any(_img_base.startswith(p) for p in _excl_prefixes):
+                    continue
             all_filtered.append((pid, pinfo))
         return cristy_products, all_filtered, skipped_by_date, skipped_cristy
 
@@ -1521,6 +1539,12 @@ class PWACartAPIServer:
             filename = unquote(filename)
             base_filename = os.path.basename(filename)
             base_filename_clean = _normalize_image_filename(base_filename)
+            # CHANGE: 排除未完成处理的产品图片，直接 404 减少日志噪音
+            _excl = getattr(self, 'productos_exclude_file_prefixes', None) or []
+            if _excl:
+                _base_no_ext = os.path.splitext(base_filename or base_filename_clean or '')[0].lower()
+                if _base_no_ext and any(_base_no_ext.startswith(p) for p in _excl):
+                    return jsonify({"error": "excluded", "hint": "productos_exclude_file_prefixes"}), 404
             
             def _find_file_recursive(root_dir, target_name, max_depth=10, _depth=0, exclude_subdirs=None):
                 if _depth >= max_depth:
@@ -2207,6 +2231,7 @@ class PWACartAPIServer:
                             combined_search.append((pid, pinfo))
                     # NOTE: 补充被日期过滤掉的「其他供应商」产品，使按产品代码搜索能命中任意产品
                     _whitelist = getattr(self, 'other_supplier_codes', None) or ['Importadora_Chinito', 'IMP158', 'Importadorawoni', 'ayacuchoamoreshop', 'ecuarticulos']
+                    _excl_search = getattr(self, 'productos_exclude_file_prefixes', None) or []
                     for pid, pinfo in products.items():
                         if not pinfo.get('is_active', 1):
                             continue
@@ -2215,6 +2240,12 @@ class PWACartAPIServer:
                             continue
                         if not cp or cp not in [c.lower() for c in _whitelist if c]:
                             continue
+                        # CHANGE: 排除未完成处理的产品（如图片 importadoraWoni_ 仅OCR未白底）
+                        if _excl_search:
+                            _img = (pinfo.get('ruta_imagen_raw') or pinfo.get('ruta_imagen') or pinfo.get('image_path') or '')
+                            _img_base = os.path.basename(str(_img).replace('\\', '/')).lower() if _img else ''
+                            if _img_base and any(_img_base.startswith(p) for p in _excl_search):
+                                continue
                         key = _norm_code(pid, pinfo) or str(pid)
                         if key not in seen_search:
                             seen_search.add(key)
@@ -2455,8 +2486,12 @@ class PWACartAPIServer:
                         if _key_raw not in _image_to_product:
                             _image_to_product[_key_raw] = (_pid, _pinfo)
                     _image_first_others = []
+                    _excl_prefixes = getattr(self, 'productos_exclude_file_prefixes', None) or []
                     for _f in _files_ya_subio_no_cristy:
                         _base = os.path.splitext(_f)[0].strip()
+                        # CHANGE: 跳过未完成处理的产品（如 importadoraWoni 仅OCR未白底），避免 404 影响旧产品
+                        if _excl_prefixes and any(_base.lower().startswith(p) for p in _excl_prefixes):
+                            continue
                         _fn_norm = _normalize_image_filename(_f)
                         _pair = None
                         if _fn_norm or _f:

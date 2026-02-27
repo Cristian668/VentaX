@@ -1694,17 +1694,12 @@ function renderProducts() {
         const safeProductCode = productCode.replace(/'/g, "\\'").replace(/"/g, '&quot;');
         var needHighlight = hashSegment && (String(p.id) === hashSegment || String(productCode) === hashSegment || normForMatch(p.id) === normForMatch(hashSegment) || normForMatch(productCode) === normForMatch(hashSegment));
         var highlightClass = needHighlight ? ' product-card-highlight' : '';
-        // CHANGE: 默认批量价，无批量价用批发价；不显示 Precio Unidad 标签
-        const displayPrice = (p.bulk_price && p.bulk_price > 0)
-            ? p.bulk_price
-            : (p.wholesale_price && p.wholesale_price > 0
-                ? p.wholesale_price
-                : (p.price || 0));
-        const priceLabel = (p.bulk_price && p.bulk_price > 0)
-            ? 'Precio Bulto'
-            : (p.wholesale_price && p.wholesale_price > 0
-                ? 'Precio Mayoreo'
-                : '');
+        // CHANGE: 兼容 API 返回 price/wholesale_price/bulk_price 或 precio_unidad/precio_mayor/precio_bulto
+        const _bulk = Number(p.bulk_price || p.precio_bulto || 0);
+        const _wholesale = Number(p.wholesale_price || p.precio_mayor || 0);
+        const _price = Number(p.price || p.precio_unidad || 0);
+        const displayPrice = (_bulk > 0) ? _bulk : ((_wholesale > 0) ? _wholesale : _price);
+        const priceLabel = (_bulk > 0) ? 'Precio Bulto' : ((_wholesale > 0) ? 'Precio Mayoreo' : '');
         
         // CHANGE: 有图用 API URL 或前端回退拼 Pages URL（传 p 以区分 Cristy vs Ya Subio 根目录），无图用占位图；图加载失败时 handleImageError 换占位图不隐藏卡片
         const rawPath = p.image_path || '';
@@ -1728,8 +1723,8 @@ function renderProducts() {
                 <div class="product-code">${(displayProductCode(p.product_code || p.id || '') || '').replace(/"/g, '&quot;')}</div>
                 <div class="product-name">${(p.name || p.product_code || p.id || '').replace(/"/g, '&quot;')}</div>
                 <div class="product-price">
-                    ${priceLabel ? `<div class="price-label">${priceLabel}:</div>` : ''}
-                    <div class="price-amount">${displayPrice > 0 ? '$' + displayPrice.toFixed(2) : 'Consultar precio'}</div>
+                    ${priceLabel ? `<div class="price-label">${priceLabel}:</div>` : '<div class="price-label">Precio:</div>'}
+                    <div class="price-amount${displayPrice <= 0 ? ' price-consultar' : ''}">${displayPrice > 0 ? '$' + displayPrice.toFixed(2) : 'Consultar precio'}</div>
                 </div>
                 <div class="product-actions">
                     <button class="btn btn-primary add-to-cart-btn" data-product-id="${safeProductId}">
@@ -1915,6 +1910,8 @@ function renderCart() {
                 <button class="btn btn-primary" onclick="switchView('products')" style="position: relative; z-index: 1;">Ir a Comprar</button>
             </div>
         `;
+        // CHANGE: 购物车为空时也要更新 Subtotal/Total 归零，避免清空或删除所有商品后仍显示旧金额
+        updateCartTotal();
         return;
     }
     
