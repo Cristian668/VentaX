@@ -15,6 +15,7 @@ import unicodedata
 import urllib.request
 import urllib.error
 import socket
+from datetime import datetime, timezone, timedelta
 
 
 def _normalize(text: str) -> str:
@@ -600,15 +601,37 @@ def _off_topic_reply(user_text: str) -> str | None:
     t = _normalize(user_text.strip())
     if not t or len(t) > 120:
         return None
-    off_topic_triggers = [
-        "q hora", "que hora", "hora es", "que dia",
-        "que fecha", "fecha es", "dia es",
-        "clima", "tiempo hace", "llueve",
-    ]
-    if any(tr in t for tr in off_topic_triggers):
+    EC_TZ = timezone(timedelta(hours=-5))
+    now_ec = datetime.now(EC_TZ)
+    DIAS = ["lunes", "martes", "miércoles", "jueves", "viernes", "sábado", "domingo"]
+    MESES = ["", "enero", "febrero", "marzo", "abril", "mayo", "junio",
+             "julio", "agosto", "septiembre", "octubre", "noviembre", "diciembre"]
+    time_triggers = ["q hora", "que hora", "hora es", "la hora"]
+    if any(tr in t for tr in time_triggers):
+        h = now_ec.strftime("%I:%M %p")
         return (
-            "Eso no lo tengo a mano 😊 Pero le puedo ayudar con productos. "
-            f"¿Qué busca? Puede ver el catálogo aquí: {VENTAX_CATALOG}"
+            f"Son las {h} (hora Ecuador 🇪🇨). "
+            f"¿En qué le puedo ayudar? 😊"
+        )
+    date_triggers = ["q dia", "que dia", "dia es", "que fecha", "fecha es", "fecha de hoy"]
+    if any(tr in t for tr in date_triggers):
+        d = DIAS[now_ec.weekday()]
+        return (
+            f"Hoy es {d} {now_ec.day} de {MESES[now_ec.month]} de {now_ec.year} 😊 "
+            f"¿Le puedo ayudar con algo?"
+        )
+    weather_triggers = ["clima", "tiempo hace", "llueve"]
+    if any(tr in t for tr in weather_triggers):
+        return (
+            "No tengo info del clima 😅 pero sí le puedo ayudar con productos. "
+            f"¿Qué busca? {VENTAX_CATALOG}"
+        )
+    queue_triggers = ["hay cola", "hay fila", "mucha gente", "esta lleno", "lleno el local"]
+    if any(tr in t for tr in queue_triggers):
+        return (
+            "No tengo esa info en tiempo real 😊 Pero puede hacer su pedido en línea "
+            f"y lo recoge sin esperar: {VENTAX_CATALOG}\n"
+            "O escríbanos por WhatsApp para consultar."
         )
     troll_triggers = ["t-rex", "dinosaurio", "fosil", "alien", "ovni", "roblox"]
     if any(tt in t for tt in troll_triggers):
