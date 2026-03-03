@@ -1,0 +1,13 @@
+# Secrets & credentials
+.openclaw/
+*.env
+.env.*
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+
+# OS
+Thumbs.db
+.DS_Store
