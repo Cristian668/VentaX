@@ -331,13 +331,16 @@ def _fast_reply(user_text: str) -> str | None:
         "cuanto vale", "tienen algo", "que hay", "que ofrecen",
         "lista de productos", "ver productos", "que productos",
         "algo de", "algun producto", "tipos de producto",
-        "como salen", "como sale", "a como", "cuanto cuesta",
-        "como estan los", "como esta el", "como esta la",
+        "como salen", "como sale", "cuanto cuesta",
+        "como estan los precios", "como esta el precio", "como esta la",
         "que modelos", "fotos de", "tiene fotos",
         "pinateria", "pinata",
     ]
     if not any(tr in t for tr in triggers):
-        return None
+        if re.search(r'\ba como\b', t):
+            pass
+        else:
+            return None
     kw = _extract_product_keyword(user_text)
     if not kw or kw in _NON_PRODUCT_WORDS:
         kw = "productos"
@@ -392,12 +395,18 @@ def _greeting_reply(user_text: str) -> str | None:
     if any(cw in t for cw in compliment_words):
         return None
 
-    # 人性化：多种问候回复，更自然
+    EC_TZ = timezone(timedelta(hours=-5))
+    hour = datetime.now(EC_TZ).hour
+    if hour < 12:
+        saludo = "Buenos días"
+    elif hour < 18:
+        saludo = "Buenas tardes"
+    else:
+        saludo = "Buenas noches"
     greetings = [
-        "Hola amiga, con gusto le ayudo 😊 ¿Qué producto busca hoy?",
-        "Hola! Con gusto 😊 ¿En qué le puedo ayudar?",
-        "Buenas! Aquí estoy para ayudarle. ¿Qué anda buscando?",
-        "Hola! ¿Qué producto le interesa ver?",
+        f"¡{saludo}! 😊 Soy Carolina de Novedades Cristy, ¿en qué le puedo ayudar?",
+        f"¡{saludo} amiga! Con gusto le atiendo 😊 ¿Qué busca hoy?",
+        f"¡{saludo}! Bienvenida 😊 Cuénteme, ¿qué necesita?",
     ]
     return random.choice(greetings)
 
@@ -428,11 +437,17 @@ def _identity_reply(user_text: str) -> str | None:
     ]
     if not any(tr in t for tr in identity_triggers):
         return None
-    # CHANGE: 机器人名字 Carolina，回复更亲切
-    replies = [
-        "Soy Carolina 😊 ¿En qué puedo ayudarte?",
-        "Carolina, para servirte. ¿Qué producto busca?",
-    ]
+    has_greeting = any(g in t for g in ["hola", "buenas", "buenos", "como esta", "que tal"])
+    if has_greeting:
+        replies = [
+            "¡Hola! Bien, gracias 😊 Soy Carolina de Novedades Cristy. ¿En qué le ayudo?",
+            "¡Todo bien, gracias! Me llamo Carolina 😊 ¿Qué anda buscando?",
+        ]
+    else:
+        replies = [
+            "Soy Carolina, asesora de Novedades Cristy 😊 ¿En qué puedo ayudarte?",
+            "Me llamo Carolina 😊 Estoy para servirle. ¿Qué necesita?",
+        ]
     return random.choice(replies)
 
 
@@ -764,12 +779,12 @@ def chat(user_message: str, model: str | None = None, use_fast_path: bool = True
     :param _force_lite: 内部用，400 重试时强制用极简 prompt
     """
     if use_fast_path:
-        fast = _fast_reply(user_message)
-        if fast:
-            return fast
         identity = _identity_reply(user_message)
         if identity:
             return identity
+        fast = _fast_reply(user_message)
+        if fast:
+            return fast
         # 商务FAQ（ubicación/envíos/pago）优先于问候，避免 "hola donde están" 被问候拦截
         biz = _business_faq_reply(user_message)
         if biz:
