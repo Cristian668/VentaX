@@ -1,0 +1,45 @@
+# Render 部署配置 - 方案 A 后端
+# 文档: https://render.com/docs/blueprint-spec
+# 使用方式: Render Dashboard -> New -> Blueprint -> 连 Git 后选此文件
+
+services:
+  # === 1. PWA 购物车 API ===
+  - type: web
+    name: pwa-cart-api
+    runtime: python
+    region: oregon
+    plan: free
+    rootDir: VentaX_json/modules
+    healthCheckPath: /health
+    buildCommand: pip install -r requirements_pwa_render.txt
+    startCommand: gunicorn --bind 0.0.0.0:$PORT --workers 1 --threads 4 --timeout 120 pwa_cart_api_server:app
+    envVars:
+      - key: PYTHON_VERSION
+        value: 3.11.0
+      - key: DATABASE_URL
+        sync: false
+      - key: R2_IMAGE_BASE_URL
+        sync: false
+      - key: PAGES_IMAGE_BASE_URL
+        sync: false
+      - key: JWT_SECRET_KEY
+        generateValue: true
+
+  # === 2. VentaX 客服机器人 API ===
+  - type: web
+    name: ventax-customer-bot
+    runtime: python
+    region: oregon
+    plan: free
+    rootDir: VentaX_json/modules
+    healthCheckPath: /health
+    buildCommand: pip install flask flask-cors gunicorn
+    startCommand: gunicorn --bind 0.0.0.0:$PORT --workers 1 --threads 2 --timeout 60 ventax_customer_bot_server:app
+    envVars:
+      - key: PYTHON_VERSION
+        value: 3.11.0
+      - key: OPENROUTER_API_KEY
+        sync: false
+        # 从 openrouter.ai 获取，用于 GPT-4o-mini + Gemini Flash
+      - key: HOST
+        value: "0.0.0.0"
