@@ -2,13 +2,14 @@
 
 // ===== PWA Service Worker =====
 
-const CACHE_NAME = 'ventax-cart-v11';  // CHANGE: v11 强制更新（CORS 修复后刷新）
+const CACHE_NAME = 'ventax-cart-v26';  // CHANGE: bump cache to force refresh on Android WebView/Telegram in-app browser
 const STATIC_CACHE_URLS = [
     './',
     './index.html',
     './styles.css',
     './app.js',
-    './manifest.json'
+    './manifest.json',
+    './assets/header-brand-logo.png?v=2'
 ];
 
 // CHANGE: 检查 URL 是否可以缓存（只允许 http:// 和 https://）
@@ -36,7 +37,7 @@ self.addEventListener('install', (event) => {
             })
             .then(() => {
                 console.log('Service Worker: 安装完成');
-                return self.skipWaiting(); // 立即激活新的Service Worker
+                return self.skipWaiting(); // 立即激活，配合 app.js 的 controllerchange 自动刷新
             })
             .catch((error) => {
                 console.error('Service Worker: 安装失败', error);
@@ -220,4 +221,11 @@ self.addEventListener('notificationclick', (event) => {
     event.waitUntil(
         clients.openWindow(event.notification.data || './')
     );
+});
+
+// CHANGE: 支持页面主动触发 skipWaiting，使新 SW 立即激活（用于自动更新流程）
+self.addEventListener('message', (event) => {
+    if (event.data && event.data.type === 'SKIP_WAITING') {
+        self.skipWaiting();
+    }
 });

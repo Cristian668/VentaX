@@ -2,22 +2,45 @@
 <html lang="es">
 <head>
     <meta charset="UTF-8">
+    <!-- CHANGE: 禁止缓存，避免 Chrome/Telegram 内置浏览器加载旧版本 -->
+    <meta http-equiv="Cache-Control" content="no-cache, no-store, must-revalidate">
+    <meta http-equiv="Pragma" content="no-cache">
+    <meta http-equiv="Expires" content="0">
     <!-- CHANGE: base 按实际 path 决定。仅 path 含 /pwa_cart 时用子目录，否则用 /，避免根路径部署时 /pwa_cart/config.js 与 manifest 404 -->
     <script>
     (function(){
       var o = location.origin;
       var path = location.pathname || '';
       var base = (path.indexOf('/pwa_cart') !== -1) ? (o + '/pwa_cart/') : (o + '/');
-      document.write('<base href="' + base + '">');
-      document.write('<link rel="stylesheet" href="' + base + 'styles.css?v=13">');
-      document.write('<link rel="icon" type="image/svg+xml" href="' + base + 'icon-192.svg">');
-      document.write('<link rel="manifest" href="' + base + 'manifest.json">');
+
+      function appendHead(tag, attrs) {
+        try {
+          var el = document.createElement(tag);
+          Object.keys(attrs || {}).forEach(function(k){ el.setAttribute(k, attrs[k]); });
+          document.head.appendChild(el);
+          return el;
+        } catch (e) {
+          return null;
+        }
+      }
+
+      appendHead('base', { href: base });
+      appendHead('link', { rel: 'stylesheet', href: base + 'styles.css?v=21' });
+      appendHead('link', { rel: 'icon', type: 'image/svg+xml', href: base + 'icon-192.svg' });
+      appendHead('link', { rel: 'manifest', href: base + 'manifest.json' });
     })();
+    </script>
+    <!-- CHANGE: 兜底防护：某些内置浏览器/扩展注入混淆脚本时引用 _0xXXXX 变量，先定义避免整页脚本中断 -->
+    <script>
+      window._0x4e0fd9 = window._0x4e0fd9 || function(){ return ''; };
+      window._0x3bb557 = window._0x3bb557 || function(){ return ''; };
+      var _0x4e0fd9 = window._0x4e0fd9;
+      var _0x3bb557 = window._0x3bb557;
     </script>
     <!-- CHANGE: 老旧设备兼容 - 允许缩放便于阅读，触摸目标已≥44px -->
     <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=5.0, user-scalable=yes">
     <meta name="description" content="VentaX Carrito - Aplicación PWA">
-    <meta name="theme-color" content="#4CAF50">
+    <meta name="theme-color" content="#e91e63">
     <!-- Permissions Policy -->
     <!-- 移除 unload=* 以避免权限策略违规 -->
     <title>VentaX Carrito</title>
@@ -45,8 +68,9 @@
     <!-- 顶部导航栏 -->
     <header class="header">
         <div class="header-content">
-            <h1 class="logo"><i data-lucide="shopping-bag" class="logo-icon"></i> VentaX</h1>
+            <h1 class="logo"><img src="assets/header-brand-logo.png?v=2" alt="Cristy Novedades" class="logo-img" width="136" height="136"><span class="logo-text">SOMOS IMPORTADORES DIRECTO!!!</span></h1>
             <div class="header-actions">
+                <!-- CHANGE: 已移除頂欄 PROD/LOCAL 版本膠囊（避免對客戶顯示內部 build 標識） -->
                 <!-- CHANGE: 用户信息显示 -->
                 <div class="user-info hidden" id="userInfo">
                     <img id="userAvatar" src="" alt="Avatar" class="user-avatar">
@@ -71,16 +95,19 @@
         <!-- 产品列表视图 -->
         <section class="products-section" id="productsSection">
             <div class="section-header">
-                <h2>Catálogo de Productos</h2>
+                <h2>Buscar Productos</h2>
                 <div class="search-bar">
                     <span class="search-icon-wrap"><i data-lucide="search"></i></span>
                     <input type="text" id="searchInput" placeholder="Buscar por nombre o código..." class="search-input">
                 </div>
             </div>
+            <div class="catalog-category-tags" id="catalogCategoryTags" role="navigation" aria-label="Categorías"></div>
             <div class="products-grid" id="productsGrid">
                 <!-- 产品卡片将动态加载 -->
                 <div class="loading">Cargando productos...</div>
             </div>
+            <div class="products-load-status-wrap" id="productsLoadStatusWrap"></div>
+            <div class="pagination" id="productsPagination" style="display:none;"></div>
         </section>
 
         <!-- 购物车视图 -->
@@ -96,6 +123,10 @@
             </div>
             <div class="cart-items" id="cartItems">
                 <!-- 购物车商品将动态加载 -->
+            </div>
+            <!-- CHANGE: 商品列表与订单摘要之间增加「继续购物」按钮 -->
+            <div class="cart-continue-shopping-wrap">
+                <button class="btn btn-primary" id="continueShoppingBtn" onclick="switchView('products')" style="width: 100%; max-width: 320px; position: relative; z-index: 1;">SIGUE COMPRANDO</button>
             </div>
             <div class="cart-footer">
                 <div class="cart-summary">
@@ -197,8 +228,21 @@
         </button>
     </nav>
 
+    <!-- 技术状态条（404/5xx） -->
+    <div class="tech-status-bar hidden" id="techStatusBar" role="status" aria-live="polite">
+        <div class="tech-status-content">
+            <span class="tech-status-badge">Estado técnico</span>
+            <span class="tech-status-text" id="techStatusText">Sin errores recientes.</span>
+        </div>
+        <div class="tech-status-actions">
+            <button class="tech-status-btn" id="techStatusCopyBtn" type="button">Copiar diagnóstico</button>
+        </div>
+    </div>
+
     <!-- 加载提示 -->
     <div class="toast" id="toast"></div>
+    <!-- 技术状态条：404/5xx 诊断信息 -->
+    <div class="tech-status-bar hidden" id="techStatusBar" role="status" aria-live="polite"></div>
 
     <!-- 数量选择模态框 -->
     <div class="modal-overlay hidden" id="quantityModal">
@@ -421,7 +465,7 @@
     <!-- CHANGE: Lucide defer 加载，与 app 并行不阻塞 -->
     <script src="https://cdn.jsdelivr.net/npm/lucide@0.460.0/dist/umd/lucide.min.js" defer></script>
     <!-- 脚本：相对路径确保 Pages 下 /pwa_cart/ 能加载到同目录的 config.js；版本号防缓存 -->
-    <script src="./config.js?v=10"></script>
-    <script src="./app.js?v=22"></script>
+    <script src="./config.js?v=13"></script>
+    <script src="./app.js?v=35"></script>
 </body>
 </html>

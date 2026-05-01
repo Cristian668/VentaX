@@ -2,26 +2,40 @@
 <html lang="es">
 <head>
     <meta charset="UTF-8">
-    <!-- 强制从站点根加载 CSS，避免 /pwa_cart/#/ 下相对路径 404 导致黑白 -->
+    <!-- CHANGE: base 按实际 path 决定。仅 path 含 /pwa_cart 时用子目录，否则用 /，避免根路径部署时资源404 -->
     <script>
-      (function(){
-        var o = location.origin;
-        var link = document.createElement('link');
-        link.rel = 'stylesheet';
-        link.href = o + '/styles.css?v=13';
-        document.head.appendChild(link);
-      })();
+    (function(){
+      var o = location.origin;
+      var path = location.pathname || '';
+      var base = (path.indexOf('/pwa_cart') !== -1) ? (o + '/pwa_cart/') : (o + '/');
+
+      function appendHead(tag, attrs) {
+        try {
+          var el = document.createElement(tag);
+          Object.keys(attrs || {}).forEach(function(k){ el.setAttribute(k, attrs[k]); });
+          document.head.appendChild(el);
+          return el;
+        } catch (e) {
+          return null;
+        }
+      }
+
+      appendHead('base', { href: base });
+      appendHead('link', { rel: 'stylesheet', href: base + 'styles.css?v=21' });
+      appendHead('link', { rel: 'icon', type: 'image/svg+xml', href: base + 'icon-192.svg' });
+      appendHead('link', { rel: 'manifest', href: base + 'manifest.json' });
+    })();
     </script>
     <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=5.0, user-scalable=yes">
     <meta name="description" content="VentaX Carrito - Aplicación PWA">
-    <meta name="theme-color" content="#4CAF50">
+    <meta name="theme-color" content="#e91e63">
     <!-- Permissions Policy -->
     <!-- 移除 unload=* 以避免权限策略违规 -->
     <title>VentaX Carrito</title>
     
-    <!-- Favicon / Manifest：根路径 -->
-    <link rel="icon" type="image/svg+xml" href="/favicon.ico">
-    <link rel="manifest" href="/manifest.json">
+    <!-- Favicon / Manifest：由上方脚本按 base 注入；以下为兜底相对路径 -->
+    <link rel="icon" type="image/svg+xml" href="./icon-192.svg">
+    <link rel="manifest" href="./manifest.json">
     
     <!-- Google Fonts - 现代字体 -->
     <link rel="preconnect" href="https://fonts.googleapis.com">
@@ -34,8 +48,8 @@
     <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
     <meta name="apple-mobile-web-app-title" content="VentaX Carrito">
     
-    <!-- 样式已由顶部脚本注入（根路径），此处备用以防脚本未执行 -->
-    <link rel="stylesheet" href="/styles.css?v=9">
+    <!-- 样式由顶部脚本注入，此处兜底相对路径 -->
+    <link rel="stylesheet" href="./styles.css?v=21">
     <!-- Lucide Icons CDN - 新一代图标库 (jsdelivr 备选) -->
     <script src="https://cdn.jsdelivr.net/npm/lucide@0.460.0/dist/umd/lucide.min.js"></script>
 </head>
@@ -49,7 +63,7 @@
     <!-- 顶部导航栏 -->
     <header class="header">
         <div class="header-content">
-            <h1 class="logo"><i data-lucide="shopping-bag" class="logo-icon"></i> VentaX</h1>
+            <h1 class="logo"><img src="./assets/header-brand-logo.png?v=2" alt="Cristy Novedades" class="logo-img" width="136" height="136"><span class="logo-text">SOMOS IMPORTADORES DIRECTO!!!</span></h1>
             <div class="header-actions">
                 <!-- CHANGE: 用户信息显示 -->
                 <div class="user-info hidden" id="userInfo">
@@ -71,7 +85,7 @@
         <!-- 产品列表视图 -->
         <section class="products-section" id="productsSection">
             <div class="section-header">
-                <h2>Catálogo de Productos</h2>
+                <h2>Buscar Productos</h2>
                 <div class="search-bar">
                     <span class="search-icon-wrap"><i data-lucide="search"></i></span>
                     <input type="text" id="searchInput" placeholder="Buscar por nombre o código..." class="search-input">
@@ -96,6 +110,10 @@
             </div>
             <div class="cart-items" id="cartItems">
                 <!-- 购物车商品将动态加载 -->
+            </div>
+            <!-- CHANGE: 商品列表与订单摘要之间增加「继续购物」按钮 -->
+            <div class="cart-continue-shopping-wrap">
+                <button class="btn btn-primary" id="continueShoppingBtn" onclick="switchView('products')" style="width: 100%; max-width: 320px; position: relative; z-index: 1;">SIGUE COMPRANDO</button>
             </div>
             <div class="cart-footer">
                 <div class="cart-summary">
@@ -184,11 +202,11 @@
             <span class="nav-label">Pedidos</span>
         </button>
         <a class="nav-item nav-link" href="https://wa.me/593939962405" target="_blank" rel="noopener noreferrer" data-link="whatsapp">
-            <img src="/assets/social-logos/whatsapp.png" alt="WhatsApp" class="nav-icon-img">
+            <img src="./assets/social-logos/whatsapp.png" alt="WhatsApp" class="nav-icon-img">
             <span class="nav-label">WhatsApp</span>
         </a>
         <a class="nav-item nav-link" href="https://t.me/NovedadesCristy_gye" target="_blank" rel="noopener noreferrer" data-link="telegram">
-            <img src="/assets/social-logos/telegram.png" alt="Telegram" class="nav-icon-img">
+            <img src="./assets/social-logos/telegram.png" alt="Telegram" class="nav-icon-img">
             <span class="nav-label">Telegram</span>
         </a>
         <button class="nav-item" data-view="search" type="button" title="Buscar productos">
@@ -386,8 +404,8 @@
         </div>
     </div>
 
-    <!-- 脚本：根路径，/pwa_cart/#/ 下也能加载 -->
-    <script src="/config.js"></script>
-    <script src="/app.js?v=9"></script>
+    <!-- 脚本：相对路径确保 / 与 /pwa_cart/ 两种部署都可用 -->
+    <script src="./config.js?v=12"></script>
+    <script src="./app.js?v=34"></script>
 </body>
 </html>
