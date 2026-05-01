@@ -1343,8 +1343,74 @@ class DatabaseManager:
             return []
     
     def get_order_detail(self, order_id, user_id=None):
-        """获取订单详情（包括订单项） - CHANGE: 优先从unified_orders表读取，确保总价包含运费"""
+        """获取订单详情（包括订单项） - CHANGE: 优先从 shared_db.unified_orders 读取，确保 PEDIDOS 列表与详情一致"""
         try:
+            # CHANGE: 先从 shared_db 读取（与 get_user_orders 一致），避免“列表可见但详情404”
+            try:
+                base_dir = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+                shared_db_path = os.path.join(base_dir, 'Sistema Factura', 'shared_database.py')
+                if os.path.exists(shared_db_path):
+                    import importlib.util
+                    spec = importlib.util.spec_from_file_location("shared_database", shared_db_path)
+                    if spec and spec.loader:
+                        sm = importlib.util.module_from_spec(spec)
+                        spec.loader.exec_module(sm)
+                        db = sm.get_shared_database()
+                        if db and getattr(db, 'orders_adapter', None):
+                            prefix = getattr(db, 'orders_table_prefix', '') or ''
+                            tbl = f"{prefix}unified_orders" if prefix else "unified_orders"
+
+                            if user_id is not None:
+                                row = db.orders_adapter.fetchone(
+                                    f"SELECT order_id, user_id, subtotal, shipping, total, status, created_at, cart_items FROM {tbl} WHERE order_id = %s AND user_id = %s LIMIT 1",
+                                    (str(order_id), str(user_id))
+                                )
+                            else:
+                                row = db.orders_adapter.fetchone(
+                                    f"SELECT order_id, user_id, subtotal, shipping, total, status, created_at, cart_items FROM {tbl} WHERE order_id = %s LIMIT 1",
+                                    (str(order_id),)
+                                )
+
+                            if row:
+                                subtotal = float(row.get('subtotal') or 0)
+                                shipping = float(row.get('shipping') or 8.0)
+                                total = float(row.get('total') or 0) or (subtotal + shipping)
+                                status = row.get('status') or 'pending'
+                                created_at = row.get('created_at')
+                                cart_items_raw = row.get('cart_items') or []
+                                try:
+                                    import json
+                                    cart_items = json.loads(cart_items_raw) if isinstance(cart_items_raw, str) else list(cart_items_raw)
+                                except Exception:
+                                    cart_items = []
+
+                                items = []
+                                for item in cart_items:
+                                    product_id = str(item.get('code', item.get('product_id', item.get('id', ''))))
+                                    quantity = float(item.get('quantity', 0) or 0)
+                                    price = float(item.get('price', 0) or 0)
+                                    items.append({
+                                        'product_id': product_id,
+                                        'name': item.get('name', product_id),
+                                        'quantity': quantity,
+                                        'price': price,
+                                        'subtotal': price * quantity
+                                    })
+
+                                self.logger.info(f"📋 [get_order_detail] 从 shared_db 读取订单: order_id={order_id}")
+                                return {
+                                    'order_id': row.get('order_id'),
+                                    'user_id': row.get('user_id'),
+                                    'total_amount': total,
+                                    'subtotal': subtotal,
+                                    'shipping': shipping,
+                                    'status': status,
+                                    'created_at': created_at,
+                                    'items': items
+                                }
+            except Exception as shared_err:
+                self.logger.debug(f"📋 [get_order_detail] 从 shared_db 读取失败，回退到 db_path: {shared_err}")
+
             conn = sqlite3.connect(self.db_path)
             cursor = conn.cursor()
             

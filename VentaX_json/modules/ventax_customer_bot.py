@@ -14,21 +14,231 @@ import time
 import unicodedata
 import urllib.request
 import urllib.error
+from urllib.parse import quote
 import socket
 from datetime import datetime, timezone, timedelta
 
 
 def _normalize(text: str) -> str:
-    """去除重音符号并小写：dónde→donde, qué→que, cómo→como"""
+    """去除重音 + 小写 + 展开缩略语 + 压缩重复字符 + 西语语音容错"""
     nfkd = unicodedata.normalize('NFKD', text.lower())
-    return ''.join(c for c in nfkd if not unicodedata.combining(c))
+    t = ''.join(c for c in nfkd if not unicodedata.combining(c))
+    t = _expand_slang(t)
+    # 压缩 3+ 重复字符 → 1: "holaaaa"→"hola", "siiiii"→"si", "precioooo"→"precio"
+    t = re.sub(r'(.)\1{2,}', r'\1', t)
+    # 厄瓜多尔/拉美西语语音容错 — 映射常见发音混淆到标准拼写
+    t = _spanish_phonetic(t)
+    return t
 
-# 非产品词（动词、代词等），提取关键词时排除
+
+# ── 西班牙语语音容错 ──────────────────────────────────────
+# 厄瓜多尔/拉美 seseo + yeísmo + b/v 混淆 + h 省略
+# 对输入和触发器都适用（触发器在代码中已用标准拼写，此函数将输入映射到标准形式）
+_PHONETIC_RE = [
+    # b/v 混淆 → 统一为 v（因触发器用 "vende/envio" 等标准拼写）
+    (re.compile(r'\bb([aeiou])'), r'v\1'),       # "bende"→"vende" (词首 ba/be/bi/bo/bu)
+    (re.compile(r'nb'), 'nv'),                     # "enbio"→"envio", "enbiar"→"enviar"
+    # seseo: z→s 已在某些场景有用，但触发器用 "precio" 不用 "presio"
+    # 所以反向映射：s→c before e/i（"presio"→"precio"）
+    (re.compile(r'si([oa])'), r'cio'),             # "presio"→"precio", "presios"→"precios"
+    (re.compile(r'se([^r\s])'), r'ce\1'),          # "serca"→"cerca", "serrado"→"cerrado"
+    # h 省略 → 恢复常见词首 h
+    (re.compile(r'\b(a)(cer|cen|ce|cemos|go|gan|sta|cia)'), r'h\1\2'),  # "acer"→"hacer", "asta"→"hasta" handled by slang
+    (re.compile(r'\borario'), 'horario'),           # "orario"→"horario"
+    (re.compile(r'\bora\b'), 'hora'),               # "ora"→"hora"
+    (re.compile(r'\boras\b'), 'horas'),             # "oras"→"horas"
+    # 常见键盘相邻键误触
+    (re.compile(r'\bcusnto'), 'cuanto'),            # s 与 a 相邻
+    (re.compile(r'\bproductp'), 'producto'),        # o 与 p 相邻
+    (re.compile(r'\bprecuo'), 'precio'),            # i 与 u 相邻
+    (re.compile(r'\btieme'), 'tiene'),              # n 与 m 相邻
+    (re.compile(r'\btiene[sn]?\b'), lambda m: m.group()),  # 保护正确拼写不被后续规则破坏
+]
+
+
+def _spanish_phonetic(text: str) -> str:
+    """将常见西语发音变体/打字错误映射回标准拼写，使触发器能匹配"""
+    for pat, repl in _PHONETIC_RE:
+        text = pat.sub(repl, text)
+    return text
+
+
+# 拉美/厄瓜多尔社交媒体缩略语 → 标准西班牙语
+# 使用 \b 词边界正则匹配，避免替换词内子串（如 "atiende" 中的 "tien"）
+# 按缩写长度降序排列，长词优先匹配
+_SLANG_PAIRS = [
+    # 多字符短语
+    ("xfavor", "por favor"),
+    ("xfa",    "por favor"),
+    ("xf",     "por favor"),
+    # porque 系
+    ("xq",     "porque"),
+    ("xk",     "porque"),
+    ("pq",     "porque"),
+    ("pk",     "porque"),
+    # donde
+    ("dnde",   "donde"),
+    ("dond",   "donde"),
+    ("dnd",    "donde"),
+    # cuanto/a
+    ("cnto",   "cuanto"),
+    ("qnto",   "cuanto"),
+    ("qnta",   "cuanta"),
+    # tambien
+    ("tmb",    "tambien"),
+    ("tb",     "tambien"),
+    # saludos
+    ("bnos",   "buenos"),
+    ("bns",    "buenas"),
+    # gracias
+    ("grcias", "gracias"),
+    ("grax",   "gracias"),
+    ("grc",    "gracias"),
+    # necesito
+    ("ncsito", "necesito"),
+    ("ncesito","necesito"),
+    # quiero/quieres
+    ("kiero",  "quiero"),
+    ("qiero",  "quiero"),
+    ("qero",   "quiero"),
+    ("kieres", "quieres"),
+    ("qieres", "quieres"),
+    # tiene/tienes (solo como palabra independiente)
+    ("tien",   "tiene"),
+    ("tiens",  "tienes"),
+    # producto
+    ("prodctos","productos"),
+    ("prodcto","producto"),
+    ("prducto","producto"),
+    ("pdcto",  "producto"),
+    # descuento
+    ("dscount","descuento"),
+    ("dscto",  "descuento"),
+    # precio
+    ("precx",  "precio"),
+    ("prcio",  "precio"),
+    # direccion
+    ("direcc", "direccion"),
+    ("direc",  "direccion"),
+    # informacion
+    ("msj",    "mensaje"),
+    ("msg",    "mensaje"),
+    # envio
+    ("envx",   "envio"),
+    # hora
+    ("hra",    "hora"),
+    ("hrs",    "horas"),
+    # hasta
+    ("hsta",   "hasta"),
+    # aqui
+    ("aqi",    "aqui"),
+    ("aki",    "aqui"),
+    # hacer/hacen
+    ("asen",   "hacen"),
+    ("acer",   "hacer"),
+    ("aser",   "hacer"),
+    # estar
+    ("tamos",  "estamos"),
+    # ── 常见打字错误/字母颠倒 ──
+    # producto 变体
+    ("prodcuto","producto"),
+    ("porducto","producto"),
+    ("prductos","productos"),
+    ("producot","producto"),
+    ("rpodcuto","producto"),
+    ("porductos","productos"),
+    # precio 变体
+    ("preico",  "precio"),
+    ("prceo",   "precio"),
+    ("preicios","precios"),
+    # envio 变体
+    ("envoi",   "envio"),
+    ("envios",  "envios"),
+    ("emvio",   "envio"),
+    ("enivo",   "envio"),
+    ("eenvio",  "envio"),
+    # tiene 变体
+    ("teien",   "tiene"),
+    ("itene",   "tiene"),
+    ("teine",   "tiene"),
+    ("teinen",  "tienen"),
+    # vende 变体
+    ("bende",   "vende"),
+    ("benden",  "venden"),
+    ("bnede",   "vende"),
+    # cuanto 变体
+    ("cuento",  "cuanto"),
+    ("caunto",  "cuanto"),
+    ("cunato",  "cuanto"),
+    # donde 变体
+    ("donee",   "donde"),
+    ("odne",    "donde"),
+    ("doned",   "donde"),
+    # transferencia
+    ("tranferencia", "transferencia"),
+    ("tansferencia", "transferencia"),
+    ("trasferencia", "transferencia"),
+    ("tranferecia",  "transferencia"),
+    # direccion
+    ("direcion",  "direccion"),
+    ("direcxion", "direccion"),
+    ("direccon",  "direccion"),
+    # horario
+    ("horairo",   "horario"),
+    ("horraio",   "horario"),
+    # entrega
+    ("entrgea",   "entrega"),
+    ("entrga",    "entrega"),
+    # deposito
+    ("deposisto",  "deposito"),
+    ("depsoito",   "deposito"),
+    # pedido
+    ("pdeido",     "pedido"),
+    ("peiddo",     "pedido"),
+    # catalogo
+    ("catalgo",    "catalogo"),
+    ("cataologo",  "catalogo"),
+    # ubicacion
+    ("ubicaion",   "ubicacion"),
+    ("ubiccaion",  "ubicacion"),
+    # 单字符/双字符（仅独立词）
+    ("q",      "que"),
+    ("d",      "de"),
+    ("x",      "por"),
+    ("pa",     "para"),
+    ("bn",     "bien"),
+    ("ps",     "pues"),
+    ("nd",     "nada"),
+    ("cm",     "como"),
+    ("k",      "que"),
+]
+
+# 预编译正则：\b + escaped_abbr + \b，长词优先
+_SLANG_RE = [
+    (re.compile(r'\b' + re.escape(abbr) + r'\b'), full)
+    for abbr, full in sorted(_SLANG_PAIRS, key=lambda p: -len(p[0]))
+]
+
+
+def _expand_slang(text: str) -> str:
+    """将拉美社交媒体缩略语展开为标准西班牙语，用于下游触发器匹配"""
+    for pat, full in _SLANG_RE:
+        text = pat.sub(full, text)
+    return text
+
+# 非产品词（动词、代词、冠词、介词、运费相关等），提取关键词时排除
+# CHANGE: 加入 en/stock/del/de/al 等，避免 "tiene en stock muñecas" → ?q=en
 _NON_PRODUCT_WORDS = frozenset({
     "si", "no", "hola", "gracias", "ok", "usted", "ustedes", "tienen", "tiene",
     "venden", "vende", "tener", "vender", "producto", "productos", "que", "qué",
     "informacion", "información", "precio", "cuanto", "cuánto",
     "comprar", "ver", "buscar", "conseguir", "pedir",
+    "el", "la", "los", "las", "un", "una",  # 冠词，避免 "cuanto cuesta el envio" → ?q=el
+    "en", "del", "de", "al", "a", "con", "por", "para", "es", "da", "dan",  # 介词/副词
+    "stock", "stok",  # 库存词，非产品名
+    "envio", "envios", "enviar", "transporte", "encomienda",  # 运费相关
+    "esto", "esta", "eso", "esa", "esos", "esas", "algo",  # 指代/泛称，绝不作为 ?q=
+    "hacer", "hacerlo", "hacerla", "pedir", "pedido",  # 动词/动作，非产品名
 })
 
 # 混合模型：文字用 GPT-4o-mini（质量高），图片用 Gemini Flash（便宜40倍）
@@ -37,18 +247,53 @@ VISION_MODEL = "google/gemini-2.0-flash-001"
 FALLBACK_MODEL = "openai/gpt-4o-mini"
 VENTAX_CATALOG = "https://ventax.pages.dev/pwa_cart/"
 
+# 绝不引导客户到 ?q=productos（返回大量无信息错误产品），一律用主链接
+_NEVER_Q_KEYWORDS = frozenset({"productos", "electrodomesticos", "electrodomestico", "hogar", "ropa", "juguetes", "esto", "esta", "eso", "esa", "algo", "hacer"})
+
+
+def _sanitize_reply_urls(text: str) -> str:
+    """将 ?q=productos/esto 等错误链接替换为主链接，确保绝不引导到无效搜索页"""
+    if not text or VENTAX_CATALOG not in text:
+        return text
+    for banned in _NEVER_Q_KEYWORDS:
+        text = re.sub(rf"https://ventax\.pages\.dev/pwa_cart/\?q={re.escape(banned)}(?=[^\w]|$)", VENTAX_CATALOG, text)
+    return text
+
+
 API_TIMEOUT = 25
 API_RETRIES = 1
 API_RETRY_DELAY = 2
 
+# 未匹配消息日志 — 记录绕过所有快速路径的原始消息，用于发现新缩略语/打字模式
+_UNMATCHED_LOG = os.path.join(os.path.dirname(__file__), "..", "config", "unmatched_messages.log")
+
+
+def _log_unmatched(raw_message: str):
+    """将未被快速路径匹配的消息记录到日志文件，供后续分析"""
+    try:
+        normalized = _normalize(raw_message)
+        ts = datetime.now(timezone(timedelta(hours=-5))).strftime("%Y-%m-%d %H:%M")
+        line = f"[{ts}] RAW: {raw_message.strip()[:120]}  |  NORM: {normalized[:120]}\n"
+        with open(_UNMATCHED_LOG, "a", encoding="utf-8") as f:
+            f.write(line)
+        # 保持日志文件不超过 500 行
+        try:
+            with open(_UNMATCHED_LOG, "r", encoding="utf-8") as f:
+                lines = f.readlines()
+            if len(lines) > 500:
+                with open(_UNMATCHED_LOG, "w", encoding="utf-8") as f:
+                    f.writelines(lines[-300:])
+        except Exception:
+            pass
+    except Exception:
+        pass
+
 # 产品类极简 prompt（快速路径不调 LLM，此处仅作 fallback）
+# NOTE: NUNCA usar "productos" como KEYWORD；?q=productos 会返回大量无信息错误产品
 SYSTEM_PROMPT_PRODUCT = """Eres la asesora de VentaX Ecuador. Una sola regla:
-Si el cliente menciona producto (tiene X, qué venden, q producto, lapiz, bolso, etc):
-Responde exactamente 3 líneas:
-1. Sí amiga, claro 👇
-2. https://ventax.pages.dev/pwa_cart/?q=KEYWORD
-3. Abre y veras modelos/fotos al instante.
-Usa la palabra del producto como KEYWORD. Nada más."""
+Si el cliente menciona producto concreto (tiene agenda, lapiz, bolso, etc): usa ?q=palabra_del_producto.
+Si NO menciona producto concreto (qué venden, q producto): usa solo https://ventax.pages.dev/pwa_cart/
+NUNCA uses "productos" como KEYWORD en ?q=."""
 
 # distilled 知识路径（相对于 internal 根）
 _KNOWLEDGE_DIR = None
@@ -203,6 +448,15 @@ _CORE_PRINCIPLE = """
 Actúa como amiga de la cliente. Dos situaciones:
 1) Si ya sabe qué producto quiere: guíala al enlace con búsqueda directa.
 2) Si no sabe qué necesita: escucha su necesidad, uso y cantidad; recomienda productos del catálogo que le encajen. Objetivo: cliente contenta, recompra, ciclo virtuoso.
+
+DATOS DE LA TIENDA (obligatorio usar cuando pregunten):
+- Horario: Lunes a Sábado 9:00 AM — 6:30 PM | Domingo 9:30 AM — 5:00 PM
+- Ubicación: Novedades Cristy — Lorenzo de Garaycoa 1521 y Colón, Guayaquil, Ecuador
+- Envío: A todo Ecuador, costo aproximado $8 (varía según distancia/cantidad). Guayaquil: entrega al siguiente día hábil. Otras ciudades: 2-3 días hábiles.
+- Pago: Transferencia bancaria o depósito.
+
+IMPORTANTE — Escalamiento a humano:
+Si el cliente tiene un problema que NO puedes resolver (reclamos graves, devoluciones, problemas de pago, errores de pedido, temas legales, o cualquier situación compleja), responde amablemente y pídele que llame por WhatsApp al 0939962405. Indica que puede tocar el número para llamar directamente. Ejemplo: "Para resolver esto de la mejor manera, te invito a llamarnos por WhatsApp 📞 al 0939962405. Puede tocar el número para llamar directamente. ¡Con gusto te atendemos personalmente!"
 """
 
 
@@ -224,7 +478,10 @@ def _build_system_prompt(intent: str, lite: bool = False) -> str:
     elif intent == "low" and low_md:
         prompt = base + "Sigue estas guías para contactos fríos (baja intención). Si no sabe qué buscar: escucha y recomienda según su necesidad y cantidad:\n\n" + low_md
     else:
-        prompt = base + "Si mencionan producto, da el enlace: https://ventax.pages.dev/pwa_cart/"
+        prompt = base + (
+            "Si mencionan producto concreto (ej. agenda, lapiz), da: https://ventax.pages.dev/pwa_cart/?q=palabra. "
+            "NUNCA uses 'productos' en ?q=. Si no saben qué buscar, da solo: https://ventax.pages.dev/pwa_cart/"
+        )
     if skills_md:
         prompt += "\n\n## Habilidades de servicio y ventas (obligatorio seguir)\n\n" + skills_md
     return prompt
@@ -238,7 +495,8 @@ def _get_llm_fallback_reply(intent: str) -> str:
         return (
             "Con gusto le ayudo. Me indica producto, cantidad y ciudad "
             "para darle precio y envío. O revise aquí: "
-            f"{VENTAX_CATALOG}"
+            f"{VENTAX_CATALOG}\n"
+            "Si necesita ayuda urgente, llámenos por WhatsApp 📞 al 0939962405 (toque el número para llamar)."
         )
     return (
         "Hola, con gusto le ayudo 😊 "
@@ -252,14 +510,29 @@ def _get_api_key():
     key = os.environ.get("OPENROUTER_API_KEY")
     if key:
         return key
+    _base = os.path.join(os.path.dirname(__file__), "..", "..")
+    # openclaw.json → env.OPENROUTER_API_KEY
     try:
-        cfg_path = os.path.join(
-            os.path.dirname(__file__), "..", "..", ".openclaw", "openclaw.json"
-        )
+        cfg_path = os.path.join(_base, ".openclaw", "openclaw.json")
         if os.path.exists(cfg_path):
             with open(cfg_path, encoding="utf-8") as f:
                 cfg = json.load(f)
-                return cfg.get("env", {}).get("OPENROUTER_API_KEY")
+                k = cfg.get("env", {}).get("OPENROUTER_API_KEY")
+                if k:
+                    return k
+    except Exception:
+        pass
+    # auth-profiles.json → openrouter:default.key
+    try:
+        ap_path = os.path.join(
+            _base, ".openclaw", "agents", "main", "agent", "auth-profiles.json"
+        )
+        if os.path.exists(ap_path):
+            with open(ap_path, encoding="utf-8") as f:
+                ap = json.load(f)
+                k = ap.get("profiles", {}).get("openrouter:default", {}).get("key")
+                if k:
+                    return k
     except Exception:
         pass
     return None
@@ -284,11 +557,31 @@ def _extract_product_keyword(text: str) -> str:
     if re.search(r"q\s*tienen\b", text, re.I):
         return "productos"
 
-    # tiene X, vende X（X 为具体产品名）
-    m = re.search(r"tiene\s+(\w+)", text, re.I)
+    # CHANGE: "tiene en stock X" / "hay en stock X" 优先于 "tiene X"，避免 ?q=en
+    m = re.search(r"tiene[ns]?\s+en\s+stock\s+(\w+)", text, re.I)
+    if m and m.group(1) not in _NON_PRODUCT_WORDS:
+        return m.group(1)
+    m = re.search(r"hay\s+en\s+stock\s+(\w+)", text, re.I)
+    if m and m.group(1) not in _NON_PRODUCT_WORDS:
+        return m.group(1)
+    # CHANGE: "tiene el/la/los/las/un/una X" 跳过冠词提取产品名，避免 ?q=el
+    m = re.search(r"tiene[ns]?\s+(?:el|la|los|las|un|una)\s+(\w+)", text, re.I)
+    if m and m.group(1) not in _NON_PRODUCT_WORDS:
+        return m.group(1)
+    m = re.search(r"vende[ns]?\s+(?:el|la|los|las|un|una)\s+(\w+)", text, re.I)
+    if m and m.group(1) not in _NON_PRODUCT_WORDS:
+        return m.group(1)
+    # tiene/tienes X, vende X, disponible X, hay X（X 为具体产品名）
+    m = re.search(r"tiene[ns]?\s+(\w+)", text, re.I)
     if m and m.group(1) not in _NON_PRODUCT_WORDS:
         return m.group(1)
     m = re.search(r"vende[ns]?\s+(\w+)", text, re.I)
+    if m and m.group(1) not in _NON_PRODUCT_WORDS:
+        return m.group(1)
+    m = re.search(r"disponible\s+(\w+)", text, re.I)
+    if m and m.group(1) not in _NON_PRODUCT_WORDS:
+        return m.group(1)
+    m = re.search(r"hay\s+(\w+)", text, re.I)
     if m and m.group(1) not in _NON_PRODUCT_WORDS:
         return m.group(1)
     m = re.search(r"producto\s+(\w+)", text, re.I)
@@ -302,16 +595,160 @@ def _extract_product_keyword(text: str) -> str:
         m = re.search(prefix, text, re.I)
         if m and m.group(1) not in _NON_PRODUCT_WORDS:
             return m.group(1)
+    # envía/mandame modelo de X, envía X — 加强产品关键词抓取
+    m = re.search(r"(?:envia[ns]?|manda(?:me)?[ns]?)\s+(?:modelo\s+de\s+)?(?:las?\s+|los?\s+|un[oa]?\s+)?(\w+)", text, re.I)
+    if m and m.group(1) not in _NON_PRODUCT_WORDS:
+        return m.group(1)
+    m = re.search(r"modelo\s+de\s+(?:las?\s+|los?\s+)?(\w+)", text, re.I)
+    if m and m.group(1) not in _NON_PRODUCT_WORDS:
+        return m.group(1)
     # "como salen las X", "a como da las X", "cuanto cuestan las X"
     m = re.search(r"(?:como\s+sale[ns]?|a\s+como\s+(?:da|dan|sale|salen)|cuanto\s+cuesta[ns]?)\s+(?:las?\s+|los?\s+|un[oa]?\s+)?(\w+)", text, re.I)
     if m and m.group(1) not in _NON_PRODUCT_WORDS:
         return m.group(1)
 
-    products = ("lapiz", "bolso", "cartera", "chupon", "maquillaje", "monedero", "juguete", "mochila", "cuaderno", "reloj", "zapato", "ropa", "moto", "espuma", "globo", "carioca", "karioca", "pistola", "pinata", "pinateria", "torta", "anilina")
+    products = ("lapiz", "bolso", "cartera", "chupon", "maquillaje", "monedero", "juguete", "mochila", "cuaderno", "reloj", "zapato", "ropa", "moto", "espuma", "globo", "carioca", "karioca", "pistola", "pinata", "pinateria", "torta", "anilina", "paragua", "paraguas")
+    # 语音 b→v 后的变体也视为产品词
+    products_v = ("volso", "volsos", "voldo")
     for w in re.findall(r"\b[a-záéíóúñ]+\b", text):
-        if w in products:
+        if w in products or w in products_v:
             return w
     return "productos"
+
+
+def _fix_product_keyword(kw: str) -> str:
+    """语音规则(b→v)/拼写纠错：volso/voldo/volsos→bolso，复数归一化；paragua→paraguas"""
+    return {
+        "volso": "bolso", "volsos": "bolso", "voldo": "bolso", "boldo": "bolso",
+        "bolsa": "bolso", "bolsos": "bolso",
+        "carteras": "cartera", "lapices": "lapiz",
+        "paragua": "paraguas",  # 拉美常见缩写
+    }.get(kw, kw)
+
+
+_DESC_SKIP = frozenset({"opciones", "mas", "todo", "algunos", "varios", "diferentes", "tipos", "modelos"})
+
+
+def _extract_product_from_description(text: str) -> str:
+    """
+    从产品描述/LLM 回复中提取关键词（如图片识别结果 "carros de juguete" → carros）
+    用于智能生成 ?q= 链接
+    """
+    t = _normalize(text.strip())
+    if not t or len(t) < 3:
+        return ""
+    # "X de juguete(s)" → X（carros de juguete, muñecas de juguete）
+    m = re.search(r"(\w+)\s+de\s+juguetes?", t, re.I)
+    if m:
+        kw = m.group(1)
+        if kw not in _NON_PRODUCT_WORDS and kw not in _DESC_SKIP:
+            return kw
+    # "set de N X" / "set de X" → X
+    m = re.search(r"set\s+de\s+(?:\d+\s+)?(\w+)", t, re.I)
+    if m:
+        kw = m.group(1)
+        if kw not in _NON_PRODUCT_WORDS and kw not in _DESC_SKIP:
+            return kw
+    # "X tipo Y"（muñecas tipo Barbie）
+    m = re.search(r"(\w+)\s+tipo\s+\w+", t, re.I)
+    if m:
+        kw = m.group(1)
+        if kw not in _NON_PRODUCT_WORDS and kw not in _DESC_SKIP:
+            return kw
+    # 已知产品词
+    products = ("lapiz", "bolso", "cartera", "chupon", "maquillaje", "monedero", "juguete",
+                "mochila", "cuaderno", "reloj", "zapato", "ropa", "moto", "espuma", "globo",
+                "carioca", "karioca", "pistola", "pinata", "pinateria", "torta", "anilina",
+                "carros", "carro", "munecas", "muneca", "dulces", "dulce")
+    for w in re.findall(r"\b[a-záéíóúñ]+\b", t):
+        if w in products and w not in _NON_PRODUCT_WORDS:
+            return w
+    return ""
+
+
+def _keyword_for_url(raw_text: str, normalized_kw: str, fixed_kw: str) -> str:
+    """
+    为 URL ?q= 参数生成关键词，保留西语重音字符（ñ, á, é 等）。
+    - 若经过拼写纠错（fixed != normalized）：使用纠错后的词
+    - 否则：从原始文本按位置还原带重音的关键词（muñecas 而非 munecas）
+    """
+    if fixed_kw != normalized_kw:
+        return fixed_kw  # 纠错词无重音，直接返回
+    raw_stripped = raw_text.strip()
+    norm_text = _normalize(raw_stripped)
+    pos = norm_text.find(normalized_kw)
+    if pos >= 0 and pos + len(normalized_kw) <= len(raw_stripped):
+        raw_kw = raw_stripped[pos : pos + len(normalized_kw)]
+        return raw_kw
+    return normalized_kw
+
+
+_ESCALATION_PHONE = "0939962405"
+
+_ESCALATION_TRIGGERS = [
+    "devolucion", "devolver", "reclamo", "queja", "reembolso", "estafa",
+    "demanda", "abogado", "legal", "defecto", "danado", "roto",
+    "no funciona", "no sirve", "llego mal", "pedido equivocado",
+    "me cobraron", "doble cobro", "no me llego", "no llega",
+    "pago erroneo", "error de pago", "problema con el pago",
+]
+
+
+def _escalation_reply(user_text: str) -> str | None:
+    """检测需要转人工的复杂问题"""
+    t = _normalize(user_text.strip())
+    if any(tr in t for tr in _ESCALATION_TRIGGERS):
+        return (
+            f"Lamento mucho lo sucedido 😔 Para resolver esto de la mejor manera, "
+            f"te invito a llamarnos por WhatsApp 📞 al {_ESCALATION_PHONE}. "
+            f"Puede tocar el número para llamar directamente. ¡Con gusto te atendemos personalmente!"
+        )
+    return None
+
+
+def _call_for_order_reply(user_text: str) -> str | None:
+    """
+    客户想打电话下单 — 给电话号码，勿返回产品链接
+    例：Quiero hacer una llamada directa para un pedido
+    """
+    t = _normalize(user_text.strip())
+    if not t or len(t) > 100:
+        return None
+    triggers = [
+        "llamada directa", "llamar directo", "llamar para pedido",
+        "hacer llamada para pedido", "llamada para pedido",
+        "quiero llamar", "llamar para ordenar", "ordenar por telefono",
+    ]
+    if not any(tr in t for tr in triggers):
+        return None
+    return (
+        f"Claro, puede llamarnos al {_ESCALATION_PHONE} para hacer su pedido. "
+        "Puede tocar el número para llamar directamente."
+    )
+
+
+def _human_support_followup_reply(user_text: str) -> str | None:
+    """
+    转人工后的追问 — 客户问「会有人接吗」「是真人吗」等，需连贯回答
+    例：Me va a contestar una persona / ¿Me atiende una persona?
+    """
+    t = _normalize(user_text.strip())
+    if not t or len(t) > 80:
+        return None
+    triggers = [
+        "contestara una persona", "contestar una persona", "contestaran una persona",
+        "me va a contestar una persona", "va a contestar una persona",
+        "atiende una persona", "atienden una persona", "me atiende una persona",
+        "es una persona", "persona real", "es persona", "humano", "humana",
+        "hablo con una persona", "hablar con persona", "hablar con una persona",
+        "me contesta una persona", "contesta una persona",
+    ]
+    if not any(tr in t for tr in triggers):
+        return None
+    return (
+        f"Sí, cuando llame al {_ESCALATION_PHONE} recibirá atención personalizada "
+        "de una persona de nuestro equipo. Puede tocar el número para llamar directamente."
+    )
 
 
 def _fast_reply(user_text: str) -> str | None:
@@ -323,8 +760,11 @@ def _fast_reply(user_text: str) -> str | None:
     if not t or len(t) < 3:
         return None
     triggers = [
-        "tiene", "tienen", "vende", "venden", "producto", "productos",
-        "lapiz", "bolso", "cartera", "chupon", "maquillaje", "juguete", "mochila", "monedero",
+        "tiene", "tienen", "vende", "venden", "disponible", "hay",
+        "producto", "productos",
+        "lapiz", "bolso", "volso", "bolsos", "boldo", "cartera", "chupon", "maquillaje", "juguete", "mochila", "monedero",
+        "electrodomesticos", "electrodomestico", "hogar", "ropa",
+        "envia", "envíame", "mandame", "manda", "modelo de",
         "q vende", "que venden", "que tienen",
         "q juguete", "que juguete", "juguete bueno", "juguete para",
         "busco", "quiero", "necesito", "informacion de", "precio de",
@@ -341,9 +781,44 @@ def _fast_reply(user_text: str) -> str | None:
             pass
         else:
             return None
-    kw = _extract_product_keyword(user_text)
-    if not kw or kw in _NON_PRODUCT_WORDS:
-        kw = "productos"
+    # 排除运费/物流/营业时间类 — 这些应由 _business_faq_reply 处理
+    non_product_context = [
+        "envio", "enviar", "envios", "transporte", "encomienda",
+        "despacho", "delivery", "deliberi",
+        "que hora", "horario", "atiende", "abre", "cierra",
+    ]
+    if any(nc in t for nc in non_product_context):
+        return None
+    norm_kw = _extract_product_keyword(user_text)
+    fixed_kw = _fix_product_keyword(norm_kw)
+    if not fixed_kw or fixed_kw in _NON_PRODUCT_WORDS:
+        fixed_kw = "productos"
+
+    # CHANGE: 泛/宽泛名词一律用主链接，除非确认数据库有该类别
+    # 含指代词 esto/esta/eso 等、动词 hacer 等，绝非产品名
+    _BANNED_Q_KEYWORDS = frozenset({
+        "productos", "electrodomesticos", "electrodomestico", "hogar", "ropa",
+        "juguetes", "cosas", "articulos", "items", "mercancia",
+        "esto", "esta", "eso", "esa", "esos", "esas", "algo",
+        "hacer", "pedir", "pedido",
+    })
+    if fixed_kw in _BANNED_Q_KEYWORDS:
+        openings = [
+            "Sí amiga, claro 👇",
+            "Claro que sí 👇",
+            "Aquí está 👇",
+            "Sí, aquí lo ve 👇",
+        ]
+        closings = [
+            "Abre y veras modelos/fotos al instante.",
+            "Ahí verás fotos y precios.",
+            "Ahí está todo el catálogo.",
+        ]
+        return f"{random.choice(openings)}\n{VENTAX_CATALOG}\n{random.choice(closings)}"
+
+    # NOTE: 保留西语重音（muñecas 而非 munecas）以提升 pwa_cart 搜索匹配
+    url_kw = _keyword_for_url(user_text, norm_kw, fixed_kw)
+    q_encoded = quote(url_kw, safe="")
 
     # 人性化：多种开场白，避免机械重复
     openings = [
@@ -359,7 +834,7 @@ def _fast_reply(user_text: str) -> str | None:
     ]
     opening = random.choice(openings)
     closing = random.choice(closings)
-    return f"{opening}\n{VENTAX_CATALOG}?q={kw}\n{closing}"
+    return f"{opening}\n{VENTAX_CATALOG}?q={q_encoded}\n{closing}"
 
 
 def _greeting_reply(user_text: str) -> str | None:
@@ -385,7 +860,7 @@ def _greeting_reply(user_text: str) -> str | None:
     if any(bk in t for bk in biz_keywords):
         return None
     product_triggers = [
-        "tiene", "vende", "producto", "lapiz", "bolso", "cartera", "chupon",
+        "tiene", "vende", "disponible", "hay", "producto", "lapiz", "bolso", "cartera", "chupon",
         "maquillaje", "como salen", "como sale", "a como", "moto", "juguete",
         "precio", "cuanto", "fotos",
     ]
@@ -453,21 +928,23 @@ def _identity_reply(user_text: str) -> str | None:
 
 def _help_reply(user_text: str) -> str | None:
     """
-    通用求助类消息快速回复 — 不调 LLM
+    通用求助/需求不清晰类 — 直接引导到主页，不调 LLM
+    CHANGE: 需求唔清晰时直接给链接，后续系统升级会加产品类别分类
     """
     t = _normalize(user_text.strip())
-    if not t or len(t) > 60:
+    if not t or len(t) > 80:
         return None
     help_triggers = [
-        "me puede ayudar", "puede ayudarme", "ayudame",
+        "me puede ayudar", "puede ayudarme", "ayudame", "me ayudas", "ayudas con",
         "me ayuda", "ayuda en algo", "puede ayudar en algo",
+        "cosas de hogar", "cosas para el hogar", "articulos de hogar",
     ]
     if not any(tr in t for tr in help_triggers):
         return None
     replies = [
-        "Claro amiga, con gusto 😊 ¿Qué producto busca o qué necesita?",
-        "Sí, aquí estoy para ayudarle. ¿Qué anda buscando?",
-        "Hola! ¿En qué le puedo ayudar? Puede ver el catálogo aquí: " + VENTAX_CATALOG,
+        f"Claro, con gusto 😊 Puede ver todo el catálogo aquí: {VENTAX_CATALOG}",
+        f"Sí, aquí está el catálogo con productos: {VENTAX_CATALOG}",
+        f"¡Con gusto! Revise aquí: {VENTAX_CATALOG}",
     ]
     return random.choice(replies)
 
@@ -480,6 +957,38 @@ def _business_faq_reply(user_text: str) -> str | None:
     t = _normalize(user_text.strip())
     if not t or len(t) > 180:
         return None
+
+    # 营业时间类 — 必须在位置和运费之前，避免 "que hora" 被 _off_topic_reply 拦截成当前时间
+    # 节假日 — 不营业，须引导到网页 24/7
+    feriado_triggers = ["feriado", "feriados", "dias feriados", "atiende feriado", "abren feriado"]
+    if any(tr in t for tr in feriado_triggers):
+        return (
+            "No, en feriados no atendemos en el local.\n"
+            "🕘 Horario: Lunes a Sábado 9:00 AM — 6:30 PM | Domingo 9:30 AM — 5:00 PM\n"
+            f"🛒 Puede comprar en línea 24/7: {VENTAX_CATALOG}"
+        )
+
+    hours_triggers = [
+        "que hora atiende", "hasta que hora", "a que hora",
+        "que hora abre", "que hora cierra", "que hora abren", "que hora cierran",
+        "horario de atencion", "horario atencion", "horario",
+        "hora de atencion", "hora atencion",
+        "cuando atiende", "cuando abren", "cuando cierran",
+        "esta abierto", "estan abierto", "abierto hoy",
+        "esta cerrado", "estan cerrado", "cerrado hoy",
+        "dias de atencion", "que dias atiende", "que dias abren",
+        "atiende hoy", "abren hoy", "trabajan hoy",
+        "atiende domingo", "abren domingo", "trabajan domingo",
+        "atiende sabado", "abren sabado",
+    ]
+    if any(tr in t for tr in hours_triggers):
+        return (
+            "Nuestro horario de atención:\n"
+            "🕘 Lunes a Sábado: 9:00 AM — 6:30 PM\n"
+            "🕤 Domingo: 9:30 AM — 5:00 PM\n"
+            "📍 Novedades Cristy — Lorenzo de Garaycoa 1521 y Colón, Guayaquil\n"
+            f"🛒 Puede comprar en línea 24/7 sin esperar: {VENTAX_CATALOG}"
+        )
 
     # 位置/地址类 — _normalize 已去重音，只需无重音版
     location_triggers = [
@@ -500,6 +1009,7 @@ def _business_faq_reply(user_text: str) -> str | None:
         "por donde",
         "donde lo podemos conseguir", "donde podemos conseguir",
         "donde lo consigo", "donde consigo",
+        "donde puedo comprar", "donde puedo pedir", "donde compro",
         "que provincia", "en que provincia",
         "donde se pide", "donde pido", "como pido", "pedir en linea",
         "comprar en linea", "comprar online", "pedir online",
@@ -512,13 +1022,71 @@ def _business_faq_reply(user_text: str) -> str | None:
             "📌 https://maps.app.goo.gl/n1v5m8E4QS9vKnvZ6"
         )
 
-    # 运费价格类
-    shipping_cost_triggers = [
-        "cuanto cuesta el envio", "costo del envio",
-        "cuanto es el envio", "precio del envio",
-        "cuanto cobra", "cobran envio", "valor del envio",
+    # 到店自提类 — 必须包含地址链接
+    retiro_triggers = [
+        "retiro en el local", "retiro en local", "retirar en el local", "retirar en local",
+        "retiro en tienda", "retirar en tienda", "puedo retirar", "retiro en su local",
+        "pasar a retirar", "ir a retirar", "buscar en el local", "recoger en local",
     ]
-    if any(tr in t for tr in shipping_cost_triggers):
+    if any(tr in t for tr in retiro_triggers):
+        return (
+            "¡Claro! Puede retirar su pedido en nuestro local.\n"
+            "📍 Novedades Cristy — Lorenzo de Garaycoa 1521 y Colón, Guayaquil\n"
+            "📌 https://maps.app.goo.gl/n1v5m8E4QS9vKnvZ6\n"
+            "😊 Si decide hacer la compra, avíseme y coordinamos su retiro."
+        )
+
+    # 运费价格类 — 优先匹配，避免被产品搜索拦截（如 "cuanto cuesta el envio" → ?q=el）
+    shipping_cost_triggers = [
+        "cuanto cuesta el envio", "cuanto cuesta envio",
+        "costo del envio", "costo envio",
+        "cuanto es el envio", "precio del envio", "precio envio",
+        "cuanto cobra", "cobran envio", "valor del envio", "valor envio",
+        "cuanto cuesta enviar", "cuanto cuesta envios",
+        "cuanto vale el envio", "cuanto vale enviar",
+        "precio del transporte", "costo del transporte", "precio transporte",
+        "cuanto cuesta el transporte", "cuanto es el transporte",
+        "que precio tiene el transporte", "que precio tiene el envio",
+        "que cuesta el envio", "que cuesta enviar",
+        "que tiene el envio", "que valor tiene el envio",
+    ]
+    # 加拉帕戈斯 — 须在 shipping_cost 之前，避免被通用运费拦截
+    # CHANGE: 加入 galaspago/galapago 等拼写变体，智能识别客户咨询
+    galapagos_triggers = [
+        "galapagos", "galápagos", "galaspago", "galapago",
+        "islas galapagos", "santa cruz galapagos", "puerto ayora", "baltra", "san cristobal"
+    ]
+    # 匹配：地区名 + 运费/发货相关词（envio/hacer envio/si envian 等）
+    galapagos_envio_words = ["envio", "envios", "enviar", "envian", "hacer envio", "hacen envio", "llega", "mandan", "como", "costo", "precio", "cuanto"]
+    if any(tr in t for tr in galapagos_triggers) and any(w in t for w in galapagos_envio_words):
+        return (
+            "Sí, hacemos envíos a Galápagos 📦\n"
+            "Solo por mar o avión (no mensajería terrestre). El costo depende del peso y cantidad; le damos la info para que consulte:\n\n"
+            "• Carga/contenedor (mar): Pacific Cargo Line (PCL) — Guayaquil ↔ Galápagos\n"
+            "  📍 Domingo Comín S/L 29, Edif. Puertogal, Guayaquil\n"
+            "  📞 +593 96-707-8696 | guayaquil@pcl.ec\n"
+            "• Vuelos (paquete pequeño): LATAM, Avianca — Quito/Guayaquil ↔ Baltra/San Cristóbal\n"
+            "  Consulte horarios y precios directamente con las aerolíneas.\n\n"
+            f"¿Qué producto le interesa? {VENTAX_CATALOG}"
+        )
+
+    # CHANGE: "cuanto cuesta/vale/es" + envio/envios/enviar 组合也视为运费问题（语音截断等）
+    is_shipping_cost = any(tr in t for tr in shipping_cost_triggers) or (
+        any(phrase in t for phrase in ["cuanto cuesta", "cuanto vale", "cuanto es"]) and
+        any(w in t for w in ["envio", "envios", "enviar"])
+    )
+    # CHANGE: "X bultos/cajas a [ciudad]" + costo/precio/cuanto → 运费咨询（避免被 ?q=5 产品搜索拦截）
+    # 例: "que costo tiene 5 bultos a Machala" / "precio 3 cajas a Quito"
+    # NOTE: _normalize 会将 b→v（西语语音），故 bultos→vultos，需同时匹配
+    _ciudades_ec = ("machala", "quito", "guayaquil", "cuenca", "manta", "santo domingo",
+                    "loja", "ambato", "portoviejo", "esmeraldas", "duran", "milagro")
+    _bultos_words = ("bultos", "bulto", "vultos", "vulto", "cajas", "caja")
+    is_bultos_envio = (
+        any(w in t for w in ["costo", "precio", "cuanto", "cuesta", "valor"]) and
+        any(w in t for w in _bultos_words) and
+        (re.search(r"\ba\s+\w", t) or any(ci in t for ci in _ciudades_ec) or "provincia" in t or "ciudad" in t)
+    )
+    if is_shipping_cost or is_bultos_envio:
         return (
             "El envío es aproximadamente $8, a nivel nacional 🇪🇨📦\n"
             "Puede variar según la distancia, cantidad de productos y número de cajas. "
@@ -536,20 +1104,83 @@ def _business_faq_reply(user_text: str) -> str | None:
         )
 
     # 发货/物流类
+    # 发货时间类 — "cuanto tarda", "que tiempo se demora" 等
+    shipping_time_triggers = [
+        "cuanto tarda", "cuanto demora", "cuanto se demora",
+        "que tiempo se demora", "que tiempo demora",
+        "tiempo de entrega", "tiempo de envio",
+        "cuando llega", "en cuanto llega",
+        "cuantos dias tarda", "cuantos dias demora",
+        "se demora en enviar", "se demora en llegar",
+    ]
+    if any(tr in t for tr in shipping_time_triggers):
+        return (
+            "El envío demora de 1 a 3 días hábiles 📦 dependiendo de la ciudad.\n"
+            "Guayaquil: entrega al siguiente día hábil.\n"
+            "Otras ciudades: 2-3 días hábiles.\n"
+            "¿Me indica su ciudad y qué producto le interesa? 😊"
+        )
+
+    # 本地/同城摩托/的士送货 — 客人对运费敏感，灵活提供多种选项
+    motorizado_triggers = [
+        "motorizado", "moto", "motocicleta", "taxi", "taxista",
+        "envio en moto", "enviar con moto", "delivery en moto",
+        "envio en taxi", "enviar con taxi", "rapido", "rappi",
+        "mensajero", "mensajeria local", "entrega local",
+    ]
+    if any(tr in t for tr in motorizado_triggers):
+        return (
+            "Para envío local rápido (moto/taxi), tenemos varias opciones:\n"
+            "• Podemos ayudarle a coordinar con servicio de moto/taxi; el costo del envío lo asume el cliente.\n"
+            "• O puede buscar su propio servicio de mensajería local.\n"
+            "• También puede retirar en nuestro local: Lorenzo de Garaycoa 1521 y Colón, Guayaquil.\n"
+            "📌 https://maps.app.goo.gl/n1v5m8E4QS9vKnvZ6\n"
+            "Servicios de entrega local que puede consultar:\n"
+            "• Rappi: https://www.rappi.com.ec\n"
+            "• inDrive: https://indrive.com (taxi/moto, usted propone el precio)\n"
+            "• MiMensajeroExpress: https://www.mimensajeroexpress.com\n"
+            "• Delivereo: https://delivereo.com\n"
+            "• Gacela Delivery, Rueda Express, Moto Express Guayaquil (busque en Google/WhatsApp)\n"
+            "😊 ¿Qué producto le interesa?"
+        )
+
+    # Servientrega — 大部份外省小件用 Servientrega
+    servientrega_triggers = ["servientrega", "envian por servientrega", "envio por servientrega", "usan servientrega"]
+    if any(tr in t for tr in servientrega_triggers):
+        return (
+            "Sí, para la mayoría de pedidos a provincia usamos Servientrega 📦\n"
+            "El envío cuesta aproximadamente $8 (puede variar según distancia y cantidad).\n"
+            "Me indica su ciudad y el producto que le interesa para darle detalles. "
+            f"Puede ver los productos aquí: {VENTAX_CATALOG}"
+        )
+
+    # Transporte pesado — 尽量满足，可能需协商；偏远地区可能退而求其次用 Servientrega
+    pesado_triggers = ["transporte pesado", "trasporte pesado", "transporte pesada", "carga pesada", "envio pesado", "bultos grandes"]
+    if any(tr in t for tr in pesado_triggers):
+        return (
+            "Podemos intentar coordinar transporte pesado según su necesidad 😊\n"
+            "A veces hay que negociar porque algunos no llegan a zonas apartadas; "
+            "en ese caso usamos Servientrega como alternativa.\n"
+            "Me indica qué producto, cantidad y ciudad para ver la mejor opción. "
+            f"Catálogo: {VENTAX_CATALOG}"
+        )
+
     shipping_triggers = [
         "hacen envio", "hacer envio", "envio", "envios", "enviar",
         "pueden enviar", "puede enviar", "puedo enviar",
         "despacho", "entrega a", "llega", "llegar", "demora",
-        "cuanto tarda", "tiempo de entrega",
         "a mi ciudad", "a provincia", "servientrega", "tramaco",
         "deliberi", "delivery", "deliveri",
         "asen envio", "hacen deliberi",
         "mandan a", "despachan a", "envian a",
         "entregas en", "envios a",
+        "envio a provincia", "envian a provincia",
+        "transporte", "encomienda",
     ]
     if any(tr in t for tr in shipping_triggers):
         return (
-            "Sí, hacemos envíos a todo Ecuador 📦 "
+            "Sí, hacemos envíos a todo Ecuador 📦\n"
+            "El envío cuesta aproximadamente $8 (puede variar según distancia y cantidad).\n"
             "Me indica su ciudad y el producto que le interesa para darle detalles. "
             f"Puede ver los productos aquí: {VENTAX_CATALOG}"
         )
@@ -600,7 +1231,7 @@ def _catalog_redirect_reply(user_text: str) -> str | None:
     if not any(tr in t for tr in catalog_triggers):
         return None
     # 若已有产品词，交给 _fast_reply
-    if any(p in t for p in ["tiene ", "vende ", "lapiz", "bolso", "cartera", "juguete"]):
+    if any(p in t for p in ["tiene ", "vende ", "disponible ", "hay ", "lapiz", "bolso", "cartera", "juguete"]):
         return None
     replies = [
         f"Con gusto 😊 Aquí está el catálogo con fotos y precios: {VENTAX_CATALOG}",
@@ -621,8 +1252,14 @@ def _off_topic_reply(user_text: str) -> str | None:
     DIAS = ["lunes", "martes", "miércoles", "jueves", "viernes", "sábado", "domingo"]
     MESES = ["", "enero", "febrero", "marzo", "abril", "mayo", "junio",
              "julio", "agosto", "septiembre", "octubre", "noviembre", "diciembre"]
+    # "que hora atiende/abren/cierran" → 营业时间（已在 _business_faq_reply 处理）
+    # CHANGE: "hasta que hora" 一定是问店铺营业时间，绝不返回当前时间
+    if "hasta que hora" in t or "asta que hora" in t:
+        return None
+    # 这里只处理纯时间查询 "que hora es"
     time_triggers = ["q hora", "que hora", "hora es", "la hora"]
-    if any(tr in t for tr in time_triggers):
+    biz_hour_words = ["atiende", "atienden", "abre", "abren", "cierra", "cierran", "atencion"]
+    if any(tr in t for tr in time_triggers) and not any(bw in t for bw in biz_hour_words):
         h = now_ec.strftime("%I:%M %p")
         return (
             f"Son las {h} (hora Ecuador 🇪🇨). "
@@ -655,12 +1292,7 @@ def _off_topic_reply(user_text: str) -> str | None:
             f"😄 Aquí vendemos productos, puede verlos aquí: {VENTAX_CATALOG}",
         ]
         return random.choice(replies)
-    if any(w in t for w in ["cerrado", "serrado", "cerrada", "serrada", "abierto", "abierta", "horario"]):
-        return (
-            "Nuestro horario es de lunes a sábado 😊\n"
-            "📍 Novedades Cristy — Lorenzo de Garaycoa 1521 y Colón, Guayaquil\n"
-            f"También puede comprar en línea: {VENTAX_CATALOG}"
-        )
+    # "cerrado/abierto/horario" 已在 _business_faq_reply 处理，这里不再重复
     return None
 
 
@@ -770,50 +1402,67 @@ def _thanks_reply(user_text: str) -> str | None:
     return random.choice(replies)
 
 
-def chat(user_message: str, model: str | None = None, use_fast_path: bool = True, _force_lite: bool = False) -> str:
+def chat(user_message: str, model: str | None = None, use_fast_path: bool = True, _force_lite: bool = False, history: list | None = None) -> str:
     """
     客服回复入口
     :param user_message: 用户消息
     :param model: 可选，覆盖默认模型
     :param use_fast_path: 为 True 时，产品类问题直接返回链接，不调 LLM
     :param _force_lite: 内部用，400 重试时强制用极简 prompt
+    :param history: 对话历史 [{"role":"user"/"assistant","content":"..."},...]
     """
+    def _ret(val: str) -> str:
+        return _sanitize_reply_urls(val) if val else val
+
     if use_fast_path:
         identity = _identity_reply(user_message)
         if identity:
-            return identity
-        fast = _fast_reply(user_message)
-        if fast:
-            return fast
-        # 商务FAQ（ubicación/envíos/pago）优先于问候，避免 "hola donde están" 被问候拦截
+            return _ret(identity)
+        escalation = _escalation_reply(user_message)
+        if escalation:
+            return _ret(escalation)
+        human_followup = _human_support_followup_reply(user_message)
+        if human_followup:
+            return _ret(human_followup)
+        call_order = _call_for_order_reply(user_message)
+        if call_order:
+            return _ret(call_order)
+        # 商务FAQ（运费/营业时间/ubicación/pago）必须在 _fast_reply 之前，
+        # 否则 "cuanto cuesta el envio" 会被产品搜索拦截
         biz = _business_faq_reply(user_message)
         if biz:
-            return biz
+            return _ret(biz)
+        fast = _fast_reply(user_message)
+        if fast:
+            return _ret(fast)
         greeting = _greeting_reply(user_message)
         if greeting:
-            return greeting
+            return _ret(greeting)
         help_r = _help_reply(user_message)
         if help_r:
-            return help_r
+            return _ret(help_r)
         catalog = _catalog_redirect_reply(user_message)
         if catalog:
-            return catalog
+            return _ret(catalog)
         compliment = _compliment_reply(user_message)
         if compliment:
-            return compliment
+            return _ret(compliment)
         contact = _contact_reply(user_message)
         if contact:
-            return contact
+            return _ret(contact)
         off_topic = _off_topic_reply(user_message)
         if off_topic:
-            return off_topic
+            return _ret(off_topic)
         thanks = _thanks_reply(user_message)
         if thanks:
-            return thanks
+            return _ret(thanks)
         # 最后一道防线：评论/meme/非问题 → 快速兜底，避免无谓 LLM 超时
         comment = _comment_fallback_reply(user_message)
         if comment:
-            return comment
+            return _ret(comment)
+
+    # 所有快速路径都未匹配 → 记录原始消息供后续分析/添加新缩略语
+    _log_unmatched(user_message)
 
     api_key = _get_api_key()
     if not api_key:
@@ -824,12 +1473,13 @@ def chat(user_message: str, model: str | None = None, use_fast_path: bool = True
     url = "https://openrouter.ai/api/v1/chat/completions"
 
     def _do_request(system_content: str, max_tok: int = 180, timeout_sec: int = API_TIMEOUT) -> str:
+        msgs = [{"role": "system", "content": system_content}]
+        if history:
+            msgs.extend(history)
+        msgs.append({"role": "user", "content": user_message})
         payload = {
             "model": mdl,
-            "messages": [
-                {"role": "system", "content": system_content},
-                {"role": "user", "content": user_message},
-            ],
+            "messages": msgs,
             "max_tokens": max_tok,
             "temperature": 0.3,
         }
@@ -847,7 +1497,11 @@ def chat(user_message: str, model: str | None = None, use_fast_path: bool = True
         with urllib.request.urlopen(req, timeout=timeout_sec) as resp:
             out = json.loads(resp.read().decode())
             text = out.get("choices", [{}])[0].get("message", {}).get("content", "")
-            return text.strip() or "¿En qué más puedo ayudarte?"
+            raw = text.strip() or "¿En qué más puedo ayudarte?"
+            # CHANGE: 后处理替换泛名词 ?q=，及 volso→bolso 等拼写纠错
+            for bad, good in [("volso", "bolso"), ("boldo", "bolso"), ("volsos", "bolso"), ("voldo", "bolso")]:
+                raw = raw.replace(f"?q={bad}", f"?q={good}")
+            return _sanitize_reply_urls(raw)
 
     sys_prompt = _build_system_prompt(intent, lite=_force_lite)
 
@@ -930,17 +1584,115 @@ def chat_with_image(user_message: str, image_base64: str, mime_type: str = "imag
         },
         method="POST",
     )
+    _BANNED_Q = frozenset({"productos", "electrodomesticos", "electrodomestico", "hogar", "ropa", "juguetes"})
     for attempt in range(API_RETRIES + 1):
         try:
             with urllib.request.urlopen(req, timeout=API_TIMEOUT) as resp:
                 out = json.loads(resp.read().decode())
                 text = out.get("choices", [{}])[0].get("message", {}).get("content", "")
-                return text.strip() or f"No pude identificar el producto. Puede buscarlo aquí: {VENTAX_CATALOG}"
+                reply = text.strip() or f"No pude identificar el producto. Puede buscarlo aquí: {VENTAX_CATALOG}"
+                # NOTE: 若识别出产品，将主链接替换为 ?q=关键词 以提升搜索精准度
+                norm_kw = _extract_product_from_description(reply)
+                if norm_kw and norm_kw not in _BANNED_Q:
+                    fixed_kw = _fix_product_keyword(norm_kw)
+                    url_kw = _keyword_for_url(reply, norm_kw, fixed_kw)
+                    q_encoded = quote(url_kw, safe="")
+                    reply = reply.replace(VENTAX_CATALOG, f"{VENTAX_CATALOG}?q={q_encoded}")
+                return _sanitize_reply_urls(reply)
         except Exception:
             if attempt < API_RETRIES:
                 time.sleep(API_RETRY_DELAY)
                 continue
-            return f"No pude procesar la imagen. Puede ver el catálogo aquí: {VENTAX_CATALOG}"
+            return (
+                "En el mercado a veces es difícil encontrar algo exactamente igual, "
+                f"pero en nuestra página tenemos muchos productos nuevos donde seguro encuentra algo similar. ¡Échale un vistazo aquí! 👉 {VENTAX_CATALOG}"
+            )
+
+
+def chat_with_voice(audio_base64: str, mime_type: str = "audio/ogg", history: list | None = None) -> tuple[str, str]:
+    """
+    语音消息入口 — Gemini Flash 理解音频并回复
+    :param audio_base64: 音频 base64
+    :param mime_type: 音频 MIME (通常 audio/ogg; codecs=opus)
+    :param history: 对话历史
+    :return: (reply, transcription) 回复文本和转录文本
+    """
+    api_key = _get_api_key()
+    if not api_key:
+        return "Lo siento, no está configurada la API.", ""
+
+    clean_mime = mime_type.split(";")[0].strip() if mime_type else "audio/ogg"
+
+    sys_prompt = (
+        "Eres Carolina, asesora de Novedades Cristy / VentaX Ecuador. "
+        "El cliente envió un audio por WhatsApp. "
+        "Primero transcribe lo que dice, luego responde.\n\n"
+        "DATOS DE LA TIENDA (usa estos datos reales al responder):\n"
+        "- Tienda: Novedades Cristy\n"
+        "- Dirección: Lorenzo de Garaycoa 1521 y Colón, Guayaquil, Ecuador\n"
+        "- Google Maps: https://maps.app.goo.gl/n1v5m8E4QS9vKnvZ6\n"
+        "- Horario: Lunes a Sábado 9:00 AM — 6:30 PM | Domingo 9:30 AM — 5:00 PM\n"
+        "- Envío: A todo Ecuador, costo aprox. $8 (varía según distancia/cantidad). "
+        "Guayaquil: siguiente día hábil. Otras ciudades: 2-3 días hábiles.\n"
+        "- Pago: Transferencia bancaria o depósito.\n"
+        "- Catálogo en línea: " + VENTAX_CATALOG + "\n"
+        "- WhatsApp atención personalizada: 0939962405\n\n"
+        "Formato obligatorio:\n"
+        "[TRANSCRIPCIÓN]: (lo que dijo el cliente)\n"
+        "[RESPUESTA]: (tu respuesta como asesora)\n\n"
+        "Responde en español, breve y amigable. "
+        "Si menciona un producto concreto (ej. agenda, lapiz), dale: " + VENTAX_CATALOG + "?q=PRODUCTO. "
+        "NUNCA uses 'productos' como palabra clave. Si no menciona producto concreto, usa solo: " + VENTAX_CATALOG
+    )
+
+    msgs = [{"role": "system", "content": sys_prompt}]
+    if history:
+        msgs.extend(history)
+    msgs.append({"role": "user", "content": [
+        {"type": "text", "text": "El cliente envió este audio:"},
+        {"type": "image_url", "image_url": {
+            "url": f"data:{clean_mime};base64,{audio_base64}"
+        }},
+    ]})
+
+    payload = {
+        "model": VISION_MODEL,
+        "messages": msgs,
+        "max_tokens": 300,
+        "temperature": 0.3,
+    }
+    url = "https://openrouter.ai/api/v1/chat/completions"
+    data = json.dumps(payload).encode("utf-8")
+    req = urllib.request.Request(
+        url, data=data,
+        headers={
+            "Content-Type": "application/json",
+            "Authorization": f"Bearer {api_key}",
+            "HTTP-Referer": "https://ventax.pages.dev",
+        },
+        method="POST",
+    )
+    for attempt in range(API_RETRIES + 1):
+        try:
+            with urllib.request.urlopen(req, timeout=30) as resp:
+                out = json.loads(resp.read().decode())
+                text = out.get("choices", [{}])[0].get("message", {}).get("content", "").strip()
+                if not text:
+                    return f"No pude entender el audio. ¿Puedes escribirme? {VENTAX_CATALOG}", ""
+                transcription = ""
+                reply = text
+                if "[TRANSCRIPCIÓN]:" in text and "[RESPUESTA]:" in text:
+                    parts = text.split("[RESPUESTA]:")
+                    transcription = parts[0].replace("[TRANSCRIPCIÓN]:", "").strip()
+                    reply = parts[1].strip() if len(parts) > 1 else text
+                for bad, good in [("volso", "bolso"), ("boldo", "bolso"), ("volsos", "bolso"), ("voldo", "bolso")]:
+                    reply = reply.replace(f"?q={bad}", f"?q={good}")
+                return _sanitize_reply_urls(reply), transcription
+        except Exception:
+            if attempt < API_RETRIES:
+                time.sleep(API_RETRY_DELAY)
+                continue
+            return "Disculpa, no pude procesar tu audio. ¿Puedes escribirme tu consulta? 😊", ""
 
 
 def main():

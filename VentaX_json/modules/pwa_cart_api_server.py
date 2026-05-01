@@ -31,6 +31,35 @@ _API_CACHE = {}
 _API_CACHE_TTL_PRODUCTS = 60   # 产品列表缓存 60 秒
 _API_CACHE_TTL_BANK = 300     # 银行信息缓存 5 分钟
 
+
+def _products_list_effective_page_limit(req):
+    """
+    与前端分页对齐：app.js 使用 offset+limit，后端原先只认 page，会导致永远第 1 页；
+    且缓存 key 未含 offset 时，所有 offset 请求命中同一缓存，返回重复数据并触发海量重试。
+    """
+    try:
+        limit = int(req.args.get('limit', 30))
+        if limit < 1:
+            limit = 30
+    except (TypeError, ValueError):
+        limit = 30
+    offset_val = req.args.get('offset', type=int)
+    if offset_val is not None and offset_val >= 0:
+        page = (offset_val // limit) + 1
+    else:
+        try:
+            page = int(req.args.get('page', 1))
+        except (TypeError, ValueError):
+            page = 1
+        if page < 1:
+            page = 1
+    return page, limit
+
+
+def _products_list_cache_key(req):
+    pg, lim = _products_list_effective_page_limit(req)
+    return f"products_{req.args.get('supplier') or ''}_{req.args.get('search') or ''}_{req.args.get('category') or ''}_{pg}_{lim}"
+
 # CHANGE: 暂时註销 SQLite 产品数据，产品列表/详情仅用 PostgreSQL（购物车/订单/登录仍用 CartManager 内 db）
 USE_SQLITE_FOR_PRODUCTS = False
 
@@ -213,6 +242,43 @@ TELEGRAM_CUSTOMER_SERVICE_LINK = "https://t.me/NovedadesCristy_gye"
 JWT_SECRET_KEY = os.getenv('JWT_SECRET_KEY', 'ventax-secret-key-change-in-production-2024')
 JWT_ALGORITHM = 'HS256'
 JWT_EXPIRATION_HOURS = 24 * 7  # 7天
+
+
+def _split_multi_categories(raw_value: Any) -> List[str]:
+    """支持多分类：按逗号/竖线/分号/顿号切分并去重，返回稳定顺序列表。"""
+    s = str(raw_value or '').strip()
+    if not s:
+        return []
+    parts = re.split(r'[,|/;，、]+', s)
+    out = []
+    seen = set()
+    for p in parts:
+        t = str(p or '').strip()
+        if not t:
+            continue
+        k = t.lower()
+        if k in seen:
+            continue
+        seen.add(k)
+        out.append(t)
+    return out
+
+
+def _normalize_multi_category_storage(raw_value: Any) -> str:
+    """多分类标准存储格式：CatA, CatB, CatC；空值回 default。"""
+    cats = _split_multi_categories(raw_value)
+    return ', '.join(cats) if cats else 'default'
+
+
+def _multi_category_contains(raw_value: Any, query_value: Any) -> bool:
+    """判断 query 分类是否命中商品多分类。"""
+    q = str(query_value or '').strip().lower()
+    if not q:
+        return True
+    cats = _split_multi_categories(raw_value)
+    if not cats:
+        return q == 'default'
+    return any(str(c).strip().lower() == q for c in cats)
 
 
 def _cached_api_response(cache_key_fn, ttl):
@@ -399,7 +465,7 @@ class PWACartAPIServer:
                     resp.headers['Access-Control-Allow-Origin'] = origin
                     resp.headers['Access-Control-Allow-Credentials'] = 'true'
                     resp.headers['Access-Control-Allow-Methods'] = 'GET, POST, PUT, PATCH, DELETE, OPTIONS'
-                    resp.headers['Access-Control-Allow-Headers'] = 'Content-Type, Authorization, X-Session-Id'
+                    resp.headers['Access-Control-Allow-Headers'] = 'Content-Type, Authorization, X-Session-Id, X-Admin-Token'
                     resp.headers['Access-Control-Max-Age'] = '86400'
                     return resp
                 # 未知 origin 时仍返回 CORS 头，避免预检失败掩盖真实问题（实际响应由 after_request 控制）
@@ -878,7 +944,12 @@ class PWACartAPIServer:
         basename = _normalize_image_filename(os.path.basename(ruta_norm))
         if not basename:
             return ''
-        # CHANGE: 统一返回 /api/images/xxx，由前端根据当前站点拼出 Pages 或本机 API 地址（一键同步已把 R2 图片打包到 Pages，无需 R2_IMAGE_BASE_URL）
+        # CHANGE: 若配置 PAGES_IMAGE_BASE_URL，则直接返回 Pages 上的图片 URL（用于 pages.dev 部署）
+        pages_base = (self.pages_image_base_url or '').strip().rstrip('/') if hasattr(self, 'pages_image_base_url') else ''
+        if pages_base:
+            sub_dir = 'Cristy/' if (supplier or '').strip().lower() == 'cristy' else ''
+            return f"{pages_base}/Ya%20Subio/{sub_dir}{quote(basename)}"
+        # CHANGE: 默认返回 /api/images/xxx，由前端根据当前站点拼出 Pages 或本机 API 地址
         return '/api/images/' + basename
 
     def _pg_connect(self, pg_config: Dict) -> "Any":
@@ -1338,11 +1409,10 @@ class PWACartAPIServer:
                 continue
             # CHANGE: codigo_proveedor 可能为空，用 channel_username 回退匹配（如 Importadora_Chinito）
             chan = (pinfo.get('channel_username') or '').strip().lower().lstrip('@')
-            cp_match = cp and cp in [c.lower() for c in whitelist if c]
+            # CHANGE: 供应商识别改为仅用 channel_username；为空时回退图片路径推断。
             chan_match = chan and chan in [c.lower() for c in whitelist if c]
-            # CHANGE: 两者都空时，用 ruta_imagen 路径推断（如 output_images/Importadora_Chinito/xxx.jpg）
             path_match = False
-            if not cp_match and not chan_match:
+            if not chan_match:
                 _ruta = (pinfo.get('ruta_imagen_raw') or pinfo.get('ruta_imagen') or pinfo.get('image_path') or '')
                 if _ruta and isinstance(_ruta, str):
                     _ruta_lower = _ruta.replace('\\', '/').lower()
@@ -1350,7 +1420,7 @@ class PWACartAPIServer:
                         if _w and _w.lower() in _ruta_lower:
                             path_match = True
                             break
-            if not cp_match and not chan_match and not path_match:
+            if not chan_match and not path_match:
                 continue
             # CHANGE: 排除未完成处理的产品（如图片路径含 importadoraWoni_ 且仅OCR未白底）
             _excl_prefixes = getattr(self, 'productos_exclude_file_prefixes', None) or []
@@ -1436,7 +1506,11 @@ class PWACartAPIServer:
             index_path = os.path.join(self.app.static_folder, 'index.html') if (self.app and self.app.static_folder) else ''
             if not self.app or not self.app.static_folder or not (os.path.exists(index_path) and os.path.isfile(index_path)):
                 return redirect(os.getenv('PAGES_IMAGE_BASE_URL', 'https://ventax.pages.dev/pwa_cart').rstrip('/') + '/', code=302)
-            return send_from_directory(self.app.static_folder, 'index.html')
+            resp = send_from_directory(self.app.static_folder, 'index.html')
+            resp.headers['Cache-Control'] = 'no-store, no-cache, must-revalidate'
+            resp.headers['Pragma'] = 'no-cache'
+            resp.headers['Expires'] = '0'
+            return resp
         
         @self.app.route('/favicon.ico')
         def favicon():
@@ -1498,20 +1572,34 @@ class PWACartAPIServer:
             """PWA静态文件"""
             from flask import send_from_directory, abort, Response
             import os
-            logger.debug(f"📁 PWA静态文件请求: {filename}, static_folder: {self.app.static_folder if self.app else 'N/A'}")
-            if not self.app or not self.app.static_folder:
-                from flask import redirect
-                return redirect(os.getenv('PAGES_IMAGE_BASE_URL', 'https://ventax.pages.dev/pwa_cart').rstrip('/') + '/', code=302)
-            file_path = os.path.join(self.app.static_folder, filename)
-            logger.debug(f"📁 文件路径: {file_path}, 存在: {os.path.exists(file_path)}")
-            if os.path.exists(file_path) and os.path.isfile(file_path):
-                # 确保 SVG 文件返回正确的 Content-Type
-                if filename.endswith('.svg'):
-                    response = send_from_directory(self.app.static_folder, filename)
-                    response.headers['Content-Type'] = 'image/svg+xml; charset=utf-8'
+
+            try:
+                logger.debug(f"📁 PWA静态文件请求: {filename}, static_folder: {self.app.static_folder if self.app else 'N/A'}")
+                if not self.app or not self.app.static_folder:
+                    from flask import redirect
+                    return redirect(os.getenv('PAGES_IMAGE_BASE_URL', 'https://ventax.pages.dev/pwa_cart').rstrip('/') + '/', code=302)
+
+                safe_name = str(filename or '').replace('\\', '/').strip('/')
+                if not safe_name:
+                    abort(404)
+
+                file_path = os.path.join(self.app.static_folder, safe_name)
+                logger.debug(f"📁 文件路径: {file_path}, 存在: {os.path.exists(file_path)}")
+                if os.path.exists(file_path) and os.path.isfile(file_path):
+                    response = send_from_directory(self.app.static_folder, safe_name)
+                    # CHANGE: HTML/JS/CSS/manifest/service-worker 禁止缓存，避免 Chrome/Telegram 内置浏览器加载旧版本
+                    _no_cache = ('index.html', '404.html', 'app.js', 'styles.css', 'config.js', 'manifest.json', 'service-worker.js')
+                    if safe_name in _no_cache or safe_name.endswith(('.html', '.js', '.css', '.json')):
+                        response.headers['Cache-Control'] = 'no-store, no-cache, must-revalidate'
+                        response.headers['Pragma'] = 'no-cache'
+                        response.headers['Expires'] = '0'
+                    if safe_name.endswith('.svg'):
+                        response.headers['Content-Type'] = 'image/svg+xml; charset=utf-8'
                     return response
-                return send_from_directory(self.app.static_folder, filename)
-            else:
+                else:
+                    abort(404)
+            except Exception as e:
+                logger.exception(f"❌ PWA静态文件服务异常: {filename} -> {e}")
                 abort(404)
         
         # CHANGE: 添加对旧路径/img/的兼容支持
@@ -1533,105 +1621,377 @@ class PWACartAPIServer:
         @self.app.route('/api/images/<path:filename>')
         def serve_product_image(filename):
             """提供产品图片服务 - 仅从可配置目录（port_config.json pwa_cart.product_image_dirs）递归查找"""
-            from flask import send_from_directory, jsonify
-            from urllib.parse import unquote
-            
-            filename = unquote(filename)
-            base_filename = os.path.basename(filename)
-            base_filename_clean = _normalize_image_filename(base_filename)
-            # CHANGE: 排除未完成处理的产品图片，直接 404 减少日志噪音
-            _excl = getattr(self, 'productos_exclude_file_prefixes', None) or []
-            if _excl:
-                _base_no_ext = os.path.splitext(base_filename or base_filename_clean or '')[0].lower()
-                if _base_no_ext and any(_base_no_ext.startswith(p) for p in _excl):
-                    return jsonify({"error": "excluded", "hint": "productos_exclude_file_prefixes"}), 404
-            
-            def _find_file_recursive(root_dir, target_name, max_depth=10, _depth=0, exclude_subdirs=None):
-                if _depth >= max_depth:
+            from flask import send_from_directory, jsonify, Response, redirect
+            from urllib.parse import unquote, quote
+            import os
+            import json
+
+            try:
+                filename = unquote(str(filename or '')).strip()
+                base_filename = os.path.basename(filename)
+                base_filename_clean = _normalize_image_filename(base_filename)
+                if not base_filename and not base_filename_clean:
+                    return Response('', status=404)
+
+                # CHANGE: API 代理层支持「加密文件名映射解析」：
+                # 1) telegram_display_code_mapping.json（展示码/加密码 -> pwa_key）
+                # 2) message_id_mapping.json（加密码 -> message_id）
+                # 结合 msg_{message_id}_*.jpg / telegram_{message_id}.jpg 规则找回真实文件
+                def _safe_load_json(file_path):
+                    try:
+                        if not os.path.isfile(file_path):
+                            return {}
+                        with open(file_path, 'r', encoding='utf-8') as f:
+                            raw = f.read()
+                        if not raw.strip():
+                            return {}
+                        try:
+                            data = json.loads(raw)
+                        except ValueError as e:
+                            if 'Extra data' in str(e):
+                                dec = json.JSONDecoder()
+                                data, _ = dec.raw_decode(raw)
+                            else:
+                                return {}
+                        return data if isinstance(data, dict) else {}
+                    except Exception:
+                        return {}
+
+                def _candidate_names_from_mapping(req_name):
+                    req = (req_name or '').strip()
+                    if not req:
+                        return set(), set()
+                    req_base = os.path.splitext(_normalize_image_filename(req))[0].strip()
+                    req_base_lower = req_base.lower()
+                    ext = os.path.splitext(req)[1] or '.jpg'
+
+                    root_json_dir = os.path.normpath(os.path.join(os.path.dirname(__file__), '..'))
+                    display_map_file = os.path.join(root_json_dir, 'telegram_display_code_mapping.json')
+                    msg_map_file = os.path.join(root_json_dir, 'message_id_mapping.json')
+                    display_map = _safe_load_json(display_map_file)
+                    msg_map = _safe_load_json(msg_map_file)
+
+                    name_candidates = set()
+                    msg_id_candidates = set()
+
+                    # A) 展示码/加密码 -> pwa_key
+                    pwa_key = ''
+                    display_map_lc = {str(k).strip().lower(): str(v).strip() for k, v in display_map.items() if k}
+                    if req_base in display_map:
+                        pwa_key = str(display_map.get(req_base) or '').strip()
+                    elif req_base_lower in display_map_lc:
+                        pwa_key = display_map_lc.get(req_base_lower, '')
+                    if pwa_key:
+                        pwa_base = os.path.splitext(pwa_key)[0].strip()
+                        if pwa_base:
+                            for _e in (ext, '.jpg', '.jpeg', '.png', '.webp'):
+                                name_candidates.add(pwa_base + _e)
+
+                    # B) 加密码 -> message_id
+                    for code_key in [req_base, req_base_lower, pwa_key, os.path.splitext(pwa_key)[0].strip() if pwa_key else '']:
+                        if not code_key:
+                            continue
+                        entry = msg_map.get(code_key)
+                        if not entry and isinstance(msg_map, dict):
+                            entry = msg_map.get(str(code_key).lower()) if str(code_key) != str(code_key).lower() else None
+                        if isinstance(entry, dict):
+                            mid = str(entry.get('message_id') or '').strip()
+                            if mid.isdigit():
+                                msg_id_candidates.add(mid)
+
+                    for mid in list(msg_id_candidates):
+                        for _e in ('.jpg', '.jpeg', '.png', '.webp'):
+                            name_candidates.add(f'telegram_{mid}{_e}')
+                            # msg_{message_id}_*.ext 将由前缀匹配补全
+
+                    # C) product_mapping.json 兜底（展示码/加密码 -> product_id 等）
+                    # 目的：当 telegram_display_code_mapping 只存 key 自身时，仍可通过 product_id 找到 Ya Subio 真实文件
+                    try:
+                        product_map_file = os.path.join(root_json_dir, 'product_mapping.json')
+                        product_map = _safe_load_json(product_map_file)
+                        if isinstance(product_map, dict) and product_map:
+                            candidate_keys = []
+                            for _k in (req_base, req_base_lower, pwa_key, os.path.splitext(pwa_key)[0].strip() if pwa_key else ''):
+                                _ks = str(_k or '').strip()
+                                if _ks:
+                                    candidate_keys.append(_ks)
+                            # 再追加小写键匹配，避免大小写差异
+                            for _k in list(candidate_keys):
+                                _kl = _k.lower()
+                                if _kl not in candidate_keys:
+                                    candidate_keys.append(_kl)
+
+                            for _ck in candidate_keys:
+                                entry = product_map.get(_ck)
+                                if not isinstance(entry, dict):
+                                    continue
+                                for field in ('product_id', 'id_original', 'id_cleaned'):
+                                    v = str(entry.get(field) or '').strip()
+                                    if not v:
+                                        continue
+                                    v_base = os.path.splitext(_normalize_image_filename(os.path.basename(v)))[0].strip()
+                                    if not v_base:
+                                        continue
+                                    for _e in (ext, '.jpg', '.jpeg', '.png', '.webp'):
+                                        name_candidates.add(v_base + _e)
+                    except Exception:
+                        pass
+
+                    return name_candidates, msg_id_candidates
+
+                # CHANGE: 不再按 productos_exclude_file_prefixes 强制 404。
+                # 需求改为：只要 Ya Subio（含子目录）存在图片就应显示，避免“有图但被屏蔽成空图/404”。
+                _excl = getattr(self, 'productos_exclude_file_prefixes', None) or []
+                if _excl:
+                    _base_no_ext = os.path.splitext(base_filename or base_filename_clean or '')[0].lower()
+                    if _base_no_ext and any(_base_no_ext.startswith(p) for p in _excl):
+                        logger.info(f"ℹ️ 图片前缀命中排除列表但继续查找实际文件: {base_filename}")
+
+                def _find_file_recursive(root_dir, target_name, max_depth=10, _depth=0, exclude_subdirs=None):
+                    if _depth >= max_depth:
+                        return None
+                    exclude_subdirs = exclude_subdirs or []
+                    try:
+                        for item in os.listdir(root_dir):
+                            item_path = os.path.join(root_dir, item)
+                            if os.path.isfile(item_path):
+                                if item.lower() == target_name.lower():
+                                    return item_path
+                                if os.path.splitext(item)[0].lower() == os.path.splitext(target_name)[0].lower():
+                                    return item_path
+                            elif os.path.isdir(item_path) and item not in exclude_subdirs:
+                                r = _find_file_recursive(item_path, target_name, max_depth, _depth + 1, exclude_subdirs)
+                                if r:
+                                    return r
+                    except (PermissionError, OSError, Exception):
+                        pass
                     return None
-                exclude_subdirs = exclude_subdirs or []
-                try:
-                    for item in os.listdir(root_dir):
-                        item_path = os.path.join(root_dir, item)
-                        if os.path.isfile(item_path):
-                            if item.lower() == target_name.lower():
-                                return item_path
-                            if os.path.splitext(item)[0].lower() == os.path.splitext(target_name)[0].lower():
-                                return item_path
-                        elif os.path.isdir(item_path) and item not in exclude_subdirs:
-                            r = _find_file_recursive(item_path, target_name, max_depth, _depth + 1, exclude_subdirs)
-                            if r:
-                                return r
-                except (PermissionError, OSError, Exception):
-                    pass
-                return None
-            
-            # CHANGE: ULTIMO 产品图片固定从 pwa_cart/Ya Subio/Cristy 读取，优先在该目录查找
-            if os.path.isdir(ULTIMO_IMAGE_DIR):
-                for try_name in (base_filename, base_filename_clean):
-                    if not try_name:
-                        continue
-                    p = os.path.join(ULTIMO_IMAGE_DIR, try_name)
-                    if os.path.isfile(p):
-                        return send_from_directory(ULTIMO_IMAGE_DIR, try_name)
-                found_ultimo = _find_file_recursive(ULTIMO_IMAGE_DIR, base_filename)
-                if not found_ultimo and base_filename_clean != base_filename:
-                    found_ultimo = _find_file_recursive(ULTIMO_IMAGE_DIR, base_filename_clean)
-                if found_ultimo:
-                    return send_from_directory(os.path.dirname(found_ultimo), os.path.basename(found_ultimo))
-            # CHANGE: 遍历所有 product_image_dirs（含 output_images），使 PRODUCTOS 能提供其他供应商图
-            _all_dirs = getattr(self, 'product_image_dirs', None) or [PWA_YA_SUBIO_BASE]
-            image_dirs = list(_all_dirs) if _all_dirs else [PWA_YA_SUBIO_BASE]
-            for images_dir in image_dirs:
-                if not os.path.isdir(images_dir):
-                    continue
-                # 1) 优先在 Cristy 子文件夹内查找，确保 ULTIMO 页只显示 Cristy 内图片
-                cristy_sub = os.path.join(images_dir, 'Cristy')
-                if os.path.isdir(cristy_sub):
+
+                _mapped_name_candidates, _mapped_msg_ids = _candidate_names_from_mapping(base_filename_clean or base_filename)
+                # CHANGE: 直接按请求文件名提取 message_id（如 Importadora_Chinito_31654.jpg -> 31654），
+                # 避免缺少 mapping 文件时无法命中 msg_31654_xxx.jpg / telegram_31654.jpg。
+                _raw_mid_name = os.path.splitext(_normalize_image_filename(base_filename_clean or base_filename or ''))[0].strip().lower().replace('-', '_')
+                _direct_mid = None
+                if _raw_mid_name:
+                    _parts = _raw_mid_name.split('_')
+                    if len(_parts) >= 2 and _parts[0] == 'msg' and _parts[1].isdigit() and len(_parts[1]) >= 2:
+                        _direct_mid = _parts[1]
+                    else:
+                        for _p in reversed(_parts):
+                            if _p.isdigit() and len(_p) >= 2:
+                                _direct_mid = _p
+                                break
+                if _direct_mid and str(_direct_mid).isdigit():
+                    _mapped_msg_ids.add(str(_direct_mid))
+
+                def _find_file_by_mapped_candidates(root_dir, max_depth=10, exclude_subdirs=None):
+                    """优先按映射候选文件名命中；其次按 msg_{message_id}_ 前缀命中。"""
+                    if not os.path.isdir(root_dir):
+                        return None
+                    exclude_subdirs = exclude_subdirs or []
+                    try:
+                        # 1) 精确候选文件名
+                        for cand in _mapped_name_candidates:
+                            hit = _find_file_recursive(root_dir, cand, max_depth=max_depth, exclude_subdirs=exclude_subdirs)
+                            if hit:
+                                return hit
+                        # 2) 按 msg_{message_id}_ 前缀兜底（对应 _build_upload_filename 规则）
+                        if _mapped_msg_ids:
+                            prefixes = [f"msg_{mid}_" for mid in _mapped_msg_ids]
+                            stack = [(root_dir, 0)]
+                            while stack:
+                                cur, d = stack.pop()
+                                if d >= max_depth:
+                                    continue
+                                try:
+                                    for item in os.listdir(cur):
+                                        p = os.path.join(cur, item)
+                                        if os.path.isfile(p):
+                                            low = item.lower()
+                                            if any(low.startswith(pre) for pre in prefixes):
+                                                return p
+                                        elif os.path.isdir(p) and os.path.basename(p) not in exclude_subdirs:
+                                            stack.append((p, d + 1))
+                                except (PermissionError, OSError, Exception):
+                                    continue
+                    except Exception:
+                        pass
+                    return None
+
+                # CHANGE: ULTIMO 产品图片固定从 pwa_cart/Ya Subio/Cristy 读取，优先在该目录查找
+                if os.path.isdir(ULTIMO_IMAGE_DIR):
                     for try_name in (base_filename, base_filename_clean):
                         if not try_name:
                             continue
-                        p = os.path.join(cristy_sub, try_name)
+                        p = os.path.join(ULTIMO_IMAGE_DIR, try_name)
                         if os.path.isfile(p):
-                            logger.info(f"✅ 图片（Cristy 子文件夹）: {p}")
-                            return send_from_directory(cristy_sub, try_name)
-                    found_in_cristy = _find_file_recursive(cristy_sub, base_filename)
-                    if not found_in_cristy and base_filename_clean != base_filename:
-                        found_in_cristy = _find_file_recursive(cristy_sub, base_filename_clean)
-                    if found_in_cristy:
-                        logger.info(f"✅ 图片（Cristy 子文件夹）: {found_in_cristy}")
-                        return send_from_directory(os.path.dirname(found_in_cristy), os.path.basename(found_in_cristy))
-                # 2) 根目录及非 Cristy 子文件夹（排除 Cristy，避免同名时用到根目录图）
-                for try_name in (base_filename, base_filename_clean):
-                    if not try_name:
+                            return send_from_directory(ULTIMO_IMAGE_DIR, try_name)
+                    found_ultimo = _find_file_recursive(ULTIMO_IMAGE_DIR, base_filename)
+                    if not found_ultimo and base_filename_clean != base_filename:
+                        found_ultimo = _find_file_recursive(ULTIMO_IMAGE_DIR, base_filename_clean)
+                    # CHANGE: 映射兜底（加密码/展示码 -> 真实文件名）
+                    if not found_ultimo:
+                        found_ultimo = _find_file_by_mapped_candidates(ULTIMO_IMAGE_DIR, max_depth=10)
+                    if found_ultimo:
+                        return send_from_directory(os.path.dirname(found_ultimo), os.path.basename(found_ultimo))
+                # CHANGE: 遍历所有 product_image_dirs（含 output_images），使 PRODUCTOS 能提供其他供应商图
+                _all_dirs = getattr(self, 'product_image_dirs', None) or [PWA_YA_SUBIO_BASE]
+                image_dirs = list(_all_dirs) if _all_dirs else [PWA_YA_SUBIO_BASE]
+                for images_dir in image_dirs:
+                    if not os.path.isdir(images_dir):
                         continue
-                    p = os.path.join(images_dir, try_name)
-                    if os.path.isfile(p):
-                        logger.info(f"✅ 图片（可配置目录根）: {p}")
-                        return send_from_directory(images_dir, try_name)
-                found_path = _find_file_recursive(images_dir, base_filename, exclude_subdirs=['Cristy'])
-                if not found_path and base_filename_clean != base_filename:
-                    found_path = _find_file_recursive(images_dir, base_filename_clean, exclude_subdirs=['Cristy'])
-                if found_path:
-                    found_dir = os.path.dirname(found_path)
-                    found_file = os.path.basename(found_path)
-                    logger.info(f"✅ 图片（可配置目录子文件夹）: {found_path}")
-                    return send_from_directory(found_dir, found_file)
-            
-            # 未在可配置目录中找到；若配置了 R2_IMAGE_BASE_URL 则重定向到 R2（Render 上无本地 Ya Subio 时用）
-            r2_base = getattr(self, 'r2_image_base_url', None) or (os.getenv('R2_IMAGE_BASE_URL', '') or '').strip().rstrip('/')
-            if r2_base:
-                redirect_url = f"{r2_base}/{quote(base_filename_clean or base_filename)}"
-                logger.info(f"📷 本地无图，重定向到 R2: {redirect_url}")
-                return redirect(redirect_url, code=302)
-            logger.warning(f"❌ 未找到图片: {filename}，可配置目录: {image_dirs}")
-            print(f"❌ [API] 未找到图片: {filename}，请检查 port_config.json 或设置 R2_IMAGE_BASE_URL")
-            resp = jsonify({
-                "error": f"Imagen no encontrada: {filename}",
-                "hint": "Coloque el archivo en pwa_cart/Ya Subio/Cristy o configure R2_IMAGE_BASE_URL en Render."
-            })
-            resp.headers['Cache-Control'] = 'no-store, no-cache, must-revalidate'
-            return resp, 404
+                    # 1) 优先在 Cristy 子文件夹内查找，确保 ULTIMO 页只显示 Cristy 内图片
+                    cristy_sub = os.path.join(images_dir, 'Cristy')
+                    if os.path.isdir(cristy_sub):
+                        for try_name in (base_filename, base_filename_clean):
+                            if not try_name:
+                                continue
+                            p = os.path.join(cristy_sub, try_name)
+                            if os.path.isfile(p):
+                                logger.info(f"✅ 图片（Cristy 子文件夹）: {p}")
+                                return send_from_directory(cristy_sub, try_name)
+                        found_in_cristy = _find_file_recursive(cristy_sub, base_filename)
+                        if not found_in_cristy and base_filename_clean != base_filename:
+                            found_in_cristy = _find_file_recursive(cristy_sub, base_filename_clean)
+                        if not found_in_cristy:
+                            found_in_cristy = _find_file_by_mapped_candidates(cristy_sub, max_depth=10)
+                        if found_in_cristy:
+                            logger.info(f"✅ 图片（Cristy 子文件夹）: {found_in_cristy}")
+                            return send_from_directory(os.path.dirname(found_in_cristy), os.path.basename(found_in_cristy))
+                    # 2) 根目录及非 Cristy 子文件夹（排除 Cristy，避免同名时用到根目录图）
+                    for try_name in (base_filename, base_filename_clean):
+                        if not try_name:
+                            continue
+                        p = os.path.join(images_dir, try_name)
+                        if os.path.isfile(p):
+                            logger.info(f"✅ 图片（可配置目录根）: {p}")
+                            return send_from_directory(images_dir, try_name)
+                    found_path = _find_file_recursive(images_dir, base_filename, exclude_subdirs=['Cristy'])
+                    if not found_path and base_filename_clean != base_filename:
+                        found_path = _find_file_recursive(images_dir, base_filename_clean, exclude_subdirs=['Cristy'])
+                    if not found_path:
+                        found_path = _find_file_by_mapped_candidates(images_dir, max_depth=10, exclude_subdirs=['Cristy'])
+                    if found_path:
+                        found_dir = os.path.dirname(found_path)
+                        found_file = os.path.basename(found_path)
+                        logger.info(f"✅ 图片（可配置目录子文件夹）: {found_path}")
+                        return send_from_directory(found_dir, found_file)
+
+                # CHANGE: 对 *_no_white / *_no_hay_precio 等后缀做兼容回退
+                # 例如请求 importadoraWoni_463_no_white.jpg，实际磁盘可能只有 importadoraWoni_463.jpg。
+                _req_name = (base_filename_clean or base_filename or '').strip()
+                _req_stem, _req_ext = os.path.splitext(_req_name)
+                _suffix_variants = [
+                    '_no_white_no_hay_precio',
+                    '_white_no_hay_precio',
+                    '_no_hay_precio',
+                    '_no_white',
+                    '_white',
+                ]
+                _matched_suffix = next((s for s in _suffix_variants if _req_stem.lower().endswith(s)), '')
+                if _matched_suffix:
+                    _alt_stem = _req_stem[:-len(_matched_suffix)]
+                    _alt_candidates = [
+                        _alt_stem + (_req_ext or '.jpg'),
+                        _alt_stem + '.jpg',
+                        _alt_stem + '.jpeg',
+                        _alt_stem + '.png',
+                        _alt_stem + '.webp',
+                    ]
+                    # 去重保序
+                    _seen_alt = set()
+                    _alt_candidates = [x for x in _alt_candidates if not (x.lower() in _seen_alt or _seen_alt.add(x.lower()))]
+
+                    # 先在已配置目录中按候选名查找
+                    for _dir in image_dirs:
+                        if not os.path.isdir(_dir):
+                            continue
+                        for _cand in _alt_candidates:
+                            _hit = _find_file_recursive(_dir, _cand, max_depth=10)
+                            if _hit:
+                                logger.info(f"✅ 图片后缀回退命中: {_req_name} -> {os.path.basename(_hit)}")
+                                return send_from_directory(os.path.dirname(_hit), os.path.basename(_hit))
+
+                        # 再尝试同前缀模糊命中（避免后缀轻微差异）
+                        _prefix = _alt_stem.lower() + '_'
+                        _stack = [(_dir, 0)]
+                        while _stack:
+                            _cur, _d = _stack.pop()
+                            if _d >= 10:
+                                continue
+                            try:
+                                for _it in os.listdir(_cur):
+                                    _p = os.path.join(_cur, _it)
+                                    if os.path.isfile(_p):
+                                        _bn, _be = os.path.splitext(_it)
+                                        if _bn.lower() == _alt_stem.lower() and _be.lower() in {'.jpg', '.jpeg', '.png', '.webp'}:
+                                            logger.info(f"✅ 图片后缀回退命中(同名不同后缀): {_req_name} -> {_it}")
+                                            return send_from_directory(os.path.dirname(_p), os.path.basename(_p))
+                                        if _bn.lower().startswith(_prefix) and _be.lower() in {'.jpg', '.jpeg', '.png', '.webp'}:
+                                            logger.info(f"✅ 图片后缀回退命中(前缀): {_req_name} -> {_it}")
+                                            return send_from_directory(os.path.dirname(_p), os.path.basename(_p))
+                                    elif os.path.isdir(_p):
+                                        _stack.append((_p, _d + 1))
+                            except Exception:
+                                continue
+                else:
+                    # CHANGE: 反向兼容：请求的是基础名 xxx.jpg，而磁盘是 xxx_no_white.jpg / xxx_no_hay_precio.jpg
+                    _forward_candidates = []
+                    for _sfx in _suffix_variants:
+                        _forward_candidates.extend([
+                            _req_stem + _sfx + (_req_ext or '.jpg'),
+                            _req_stem + _sfx + '.jpg',
+                            _req_stem + _sfx + '.jpeg',
+                            _req_stem + _sfx + '.png',
+                            _req_stem + _sfx + '.webp',
+                        ])
+                    _seen_fw = set()
+                    _forward_candidates = [x for x in _forward_candidates if not (x.lower() in _seen_fw or _seen_fw.add(x.lower()))]
+
+                    for _dir in image_dirs:
+                        if not os.path.isdir(_dir):
+                            continue
+                        for _cand in _forward_candidates:
+                            _hit = _find_file_recursive(_dir, _cand, max_depth=10)
+                            if _hit:
+                                logger.info(f"✅ 图片后缀反向回退命中: {_req_name} -> {os.path.basename(_hit)}")
+                                return send_from_directory(os.path.dirname(_hit), os.path.basename(_hit))
+
+                    # CHANGE: 兜底前缀匹配（例如请求 Importadora_Chinito_31654.jpg，磁盘存在 Importadora_Chinito_31654_no_white.jpg）
+                    _prefix = _req_stem.lower() + '_'
+                    for _dir in image_dirs:
+                        if not os.path.isdir(_dir):
+                            continue
+                        _stack = [(_dir, 0)]
+                        while _stack:
+                            _cur, _d = _stack.pop()
+                            if _d >= 10:
+                                continue
+                            try:
+                                for _it in os.listdir(_cur):
+                                    _p = os.path.join(_cur, _it)
+                                    if os.path.isfile(_p):
+                                        _bn, _be = os.path.splitext(_it)
+                                        if _bn.lower().startswith(_prefix) and _be.lower() in {'.jpg', '.jpeg', '.png', '.webp'}:
+                                            logger.info(f"✅ 图片前缀回退命中: {_req_name} -> {_it}")
+                                            return send_from_directory(os.path.dirname(_p), os.path.basename(_p))
+                                    elif os.path.isdir(_p):
+                                        _stack.append((_p, _d + 1))
+                            except Exception:
+                                continue
+
+                # 未在可配置目录中找到；若配置了 R2_IMAGE_BASE_URL 则重定向到 R2（Render 上无本地 Ya Subio 时用）
+                r2_base = getattr(self, 'r2_image_base_url', None) or (os.getenv('R2_IMAGE_BASE_URL', '') or '').strip().rstrip('/')
+                if r2_base:
+                    redirect_url = f"{r2_base}/{quote(base_filename_clean or base_filename)}"
+                    logger.info(f"📷 本地无图，重定向到 R2: {redirect_url}")
+                    return redirect(redirect_url, code=302)
+                logger.warning(f"❌ 未找到图片: {filename}，可配置目录: {image_dirs}；返回 404")
+                print(f"⚠️ [API] 未找到图片: {filename}，返回 404")
+                return Response('', status=404)
+            except Exception as e:
+                logger.exception(f"❌ 图片服务异常: {filename} -> {e}")
+                return Response('', status=404)
         
         @self.app.route('/api/info')
         def api_info():
@@ -1642,6 +2002,7 @@ class PWACartAPIServer:
                 "version": "1.0.0",
                 "endpoints": {
                     "/": "PWA主页",
+                    "/api/categories": "获取分类列表 (GET)",
                     "/api/products": "获取产品列表 (GET)",
                     "/api/products/<product_id>": "获取产品详情 (GET)",
                     "/api/cart": "获取购物车 (GET)",
@@ -1669,6 +2030,429 @@ class PWACartAPIServer:
                 "timestamp": datetime.now().isoformat(),
                 "database": "connected" if self.db else "disconnected"
             })
+
+        @self.app.route('/api/categories/managed', methods=['GET'])
+        def get_managed_categories():
+            """管理端分类配置。兼容前端体检与管理页调用。"""
+            try:
+                if not self.db:
+                    return jsonify({"success": True, "data": []})
+                cats = self.db.get_categories() if hasattr(self.db, 'get_categories') else []
+                out = []
+                for c in (cats or []):
+                    if isinstance(c, dict):
+                        out.append({
+                            "name": c.get('name') or c.get('id') or '',
+                            "display_name": c.get('display_name') or c.get('name') or c.get('id') or '',
+                            "bg": c.get('bg') or c.get('color') or '#206bc4',
+                            "count": int(c.get('count') or 0)
+                        })
+                    else:
+                        name = str(c or '').strip()
+                        if name:
+                            out.append({"name": name, "display_name": name, "bg": '#206bc4', "count": 0})
+                return jsonify({"success": True, "data": out})
+            except Exception as e:
+                logger.error(f"❌ 获取 managed categories 失败: {e}")
+                return jsonify({"success": False, "error": str(e), "data": []}), 500
+
+        @self.app.route('/api/config/public', methods=['GET'])
+        def get_public_config():
+            """公开配置（前端可安全读取）。"""
+            try:
+                pages_base = getattr(self, 'pages_image_base_url', None) or (os.getenv('PAGES_IMAGE_BASE_URL', '') or '').strip().rstrip('/')
+                return jsonify({
+                    "success": True,
+                    "data": {
+                        "pages_image_base_url": pages_base,
+                        "api_base_url": "/api",
+                        "service": "pwa_cart"
+                    }
+                })
+            except Exception as e:
+                logger.error(f"❌ 获取 public config 失败: {e}")
+                return jsonify({"success": False, "error": str(e), "data": {}}), 500
+
+        def _require_admin_token_for_request():
+            """管理端接口校验 admin token（优先 X-Admin-Token，也兼容 Authorization: Bearer）。"""
+            expected = (os.getenv('ADMIN_API_TOKEN') or os.getenv('ADMIN_TOKEN') or '').strip()
+            provided = (request.headers.get('X-Admin-Token') or '').strip()
+            if not provided:
+                auth = (request.headers.get('Authorization') or '').strip()
+                if auth.lower().startswith('bearer '):
+                    provided = auth[7:].strip()
+            if not expected:
+                # 未配置时退化为兼容旧前端：要求传入非空 token
+                if not provided:
+                    return False, (jsonify({"success": False, "error": "Admin token missing"}), 401)
+                return True, None
+            if provided != expected:
+                return False, (jsonify({"success": False, "error": "Invalid admin token"}), 401)
+            return True, None
+
+        @self.app.route('/api/admin/rules/auto-unpublish/run', methods=['POST'])
+        def admin_run_auto_unpublish_rule():
+            """管理端：立即执行自动下架规则；支持 dry_run（只统计不下架）。"""
+            ok, err_resp = _require_admin_token_for_request()
+            if not ok:
+                return err_resp
+            try:
+                body = request.get_json(silent=True) or {}
+                dry_run = str(request.args.get('dry_run', '') or body.get('dry_run', '')).strip().lower() in ('1', 'true', 'yes', 'on')
+
+                pg_cfg = self._get_pg_config()
+                if not pg_cfg or not PSYCOPG2_AVAILABLE or psycopg2 is None:
+                    return jsonify({"success": False, "error": "PostgreSQL no está disponible"}), 500
+
+                conn = self._pg_connect(pg_cfg)
+                if not conn:
+                    return jsonify({"success": False, "error": "No se pudo conectar a PostgreSQL"}), 500
+
+                other_unpublished = 0
+                cristy_unpublished = 0
+                try:
+                    cur = conn.cursor()
+                    # 其他供应商：创建时间超过45天自动下架
+                    if dry_run:
+                        cur.execute(
+                            """
+                            SELECT COUNT(*)
+                            FROM products
+                            WHERE (esta_activo IS NULL OR esta_activo = TRUE)
+                              AND LOWER(COALESCE(codigo_proveedor, '')) <> 'cristy'
+                              AND COALESCE(fecha_creacion, NOW() - INTERVAL '100 years') < NOW() - INTERVAL '45 days'
+                            """
+                        )
+                        other_unpublished = int((cur.fetchone() or [0])[0] or 0)
+                    else:
+                        cur.execute(
+                            """
+                            UPDATE products
+                            SET esta_activo = FALSE
+                            WHERE (esta_activo IS NULL OR esta_activo = TRUE)
+                              AND LOWER(COALESCE(codigo_proveedor, '')) <> 'cristy'
+                              AND COALESCE(fecha_creacion, NOW() - INTERVAL '100 years') < NOW() - INTERVAL '45 days'
+                            """
+                        )
+                        other_unpublished = int(cur.rowcount or 0)
+
+                    # Cristy：库存小于6自动下架
+                    if dry_run:
+                        cur.execute(
+                            """
+                            SELECT COUNT(*)
+                            FROM products
+                            WHERE (esta_activo IS NULL OR esta_activo = TRUE)
+                              AND LOWER(COALESCE(codigo_proveedor, '')) = 'cristy'
+                              AND COALESCE(inventario, 0) < 6
+                            """
+                        )
+                        cristy_unpublished = int((cur.fetchone() or [0])[0] or 0)
+                    else:
+                        cur.execute(
+                            """
+                            UPDATE products
+                            SET esta_activo = FALSE
+                            WHERE (esta_activo IS NULL OR esta_activo = TRUE)
+                              AND LOWER(COALESCE(codigo_proveedor, '')) = 'cristy'
+                              AND COALESCE(inventario, 0) < 6
+                            """
+                        )
+                        cristy_unpublished = int(cur.rowcount or 0)
+
+                    if dry_run:
+                        conn.rollback()
+                    else:
+                        conn.commit()
+                    cur.close()
+                finally:
+                    conn.close()
+
+                return jsonify({
+                    "success": True,
+                    "data": {
+                        "dry_run": dry_run,
+                        "executed_at": datetime.now().isoformat(),
+                        "other_suppliers_older_than_45_days": other_unpublished,
+                        "cristy_inventory_below_6": cristy_unpublished,
+                        "total_unpublished": int(other_unpublished + cristy_unpublished)
+                    }
+                })
+            except Exception as e:
+                logger.error(f"❌ 自动下架执行失败: {e}")
+                return jsonify({"success": False, "error": str(e)}), 500
+
+        @_cached_api_response(lambda r: "categories", 60)
+        @self.app.route('/api/categories', methods=['GET'])
+        def get_categories():
+            """获取分类（前端 expects: {success:true,data:[{name,count}...] }）"""
+            try:
+                # categories 主要用于 products?category=XXX 的列表筛选，因此必须返回与 products 接口一致的 category_id。
+                if USE_SQLITE_FOR_PRODUCTS and self.db:
+                    products = self.db.get_all_products()
+                else:
+                    products = self._get_products_dict_from_postgres()
+
+                counts = {}
+                for _pid, pinfo in (products or {}).items():
+                    if not isinstance(pinfo, dict):
+                        continue
+                    if not pinfo.get('is_active', 1):
+                        continue
+                    cat_raw = pinfo.get('category_id', None) or pinfo.get('category', None) or 'default'
+                    cats = _split_multi_categories(cat_raw)
+                    if not cats:
+                        cats = ['default']
+                    for cat in cats:
+                        counts[cat] = counts.get(cat, 0) + 1
+
+                data = [{"name": k, "count": v} for k, v in counts.items()]
+                # 排序规则与前端一致：Cristy 最前，Otros 最后，其余按 count desc
+                def _rank(item):
+                    n = str(item.get('name', '')).strip()
+                    if n == 'Cristy':
+                        return 0
+                    if n == 'Otros':
+                        return 2
+                    return 1
+
+                data.sort(key=lambda it: (_rank(it), -int(it.get('count', 0)), str(it.get('name', ''))))
+                return jsonify({"success": True, "data": data})
+            except Exception as e:
+                logger.error(f"❌ 获取分类失败: {e}")
+                print(f"❌ [API] 获取分类失败: {e}")
+                return jsonify({"success": False, "error": str(e)}), 500
+
+        def _query_suppliers_from_channel_username():
+            """统一供应商来源：channel_username（优先 product_channel_messages，失败回退 products）"""
+            pg_cfg = self._get_pg_config()
+            if not pg_cfg or not PSYCOPG2_AVAILABLE or psycopg2 is None:
+                return []
+
+            conn = self._pg_connect(pg_cfg)
+            if not conn:
+                return []
+            try:
+                cur = conn.cursor(cursor_factory=RealDictCursor)
+                try:
+                    cur.execute(
+                        """
+                        SELECT
+                          TRIM(channel_username) AS supplier,
+                          COUNT(*) AS count
+                        FROM product_channel_messages
+                        WHERE channel_username IS NOT NULL
+                          AND TRIM(channel_username) <> ''
+                        GROUP BY 1
+                        ORDER BY count DESC, supplier ASC
+                        """
+                    )
+                    rows = cur.fetchall() or []
+                except Exception as e:
+                    logger.warning(f"⚠️ product_channel_messages 查询失败，回退 products: {e}")
+                    cur.execute(
+                        """
+                        SELECT
+                          TRIM(channel_username) AS supplier,
+                          COUNT(*) AS count
+                        FROM products
+                        WHERE channel_username IS NOT NULL
+                          AND TRIM(channel_username) <> ''
+                        GROUP BY 1
+                        ORDER BY count DESC, supplier ASC
+                        """
+                    )
+                    rows = cur.fetchall() or []
+                cur.close()
+            finally:
+                conn.close()
+
+            data = []
+            for r in rows:
+                supplier = str((r or {}).get('supplier') or '').strip()
+                if not supplier:
+                    continue
+                data.append({
+                    "supplier": supplier,
+                    "count": int((r or {}).get('count') or 0)
+                })
+            return data
+
+        @self.app.route('/api/suppliers', methods=['GET'])
+        def get_suppliers_public():
+            """公开接口：供应商列表（channel_username）"""
+            try:
+                return jsonify({"success": True, "data": _query_suppliers_from_channel_username()})
+            except Exception as e:
+                logger.error(f"❌ 获取公开供应商列表失败: {e}")
+                return jsonify({"success": False, "error": str(e), "data": []}), 500
+
+        @self.app.route('/api/admin/suppliers', methods=['GET'])
+        def admin_get_suppliers():
+            """管理端：获取供应商列表（含商品数量）。按 channel_username 作为唯一来源。"""
+            try:
+                return jsonify({"success": True, "data": _query_suppliers_from_channel_username()})
+            except Exception as e:
+                logger.error(f"❌ 获取供应商列表失败: {e}")
+                return jsonify({"success": False, "error": str(e)}), 500
+
+        @self.app.route('/api/categories/assign-by-supplier', methods=['PATCH'])
+        def assign_category_by_supplier():
+            """管理端：按供应商批量修改分类"""
+            try:
+                data = request.get_json(silent=True) or {}
+                supplier = str(data.get('supplier') or '').strip()
+                category = _normalize_multi_category_storage(data.get('category'))
+                if not supplier:
+                    return jsonify({"success": False, "error": "supplier es obligatorio"}), 400
+
+                pg_cfg = self._get_pg_config()
+                if not pg_cfg or not PSYCOPG2_AVAILABLE or psycopg2 is None:
+                    return jsonify({"success": False, "error": "PostgreSQL no está disponible"}), 500
+
+                conn = self._pg_connect(pg_cfg)
+                if not conn:
+                    return jsonify({"success": False, "error": "No se pudo conectar a PostgreSQL"}), 500
+                try:
+                    cur = conn.cursor()
+                    cur.execute(
+                        """
+                        UPDATE products
+                        SET categoria = %s
+                        WHERE (esta_activo IS NULL OR esta_activo = TRUE)
+                          AND LOWER(COALESCE(channel_username, '')) = LOWER(%s)
+                        """,
+                        (category, supplier)
+                    )
+                    updated = int(cur.rowcount or 0)
+                    conn.commit()
+                    cur.close()
+                finally:
+                    conn.close()
+
+                return jsonify({
+                    "success": True,
+                    "data": {"updated": updated, "supplier": supplier, "category": category}
+                })
+            except Exception as e:
+                logger.error(f"❌ 按供应商批量改分类失败: {e}")
+                return jsonify({"success": False, "error": str(e)}), 500
+
+        @self.app.route('/api/admin/products/<product_id>', methods=['PATCH', 'DELETE'])
+        def admin_update_or_delete_product(product_id):
+            """管理端：更新产品字段 / 软删除产品"""
+            try:
+                pid = str(product_id or '').strip()
+                if not pid:
+                    return jsonify({"success": False, "error": "product_id inválido"}), 400
+
+                pg_cfg = self._get_pg_config()
+                if not pg_cfg or not PSYCOPG2_AVAILABLE or psycopg2 is None:
+                    return jsonify({"success": False, "error": "PostgreSQL no está disponible"}), 500
+
+                conn = self._pg_connect(pg_cfg)
+                if not conn:
+                    return jsonify({"success": False, "error": "No se pudo conectar a PostgreSQL"}), 500
+
+                try:
+                    cur = conn.cursor()
+                    if request.method == 'DELETE':
+                        cur.execute(
+                            """
+                            UPDATE products
+                            SET esta_activo = FALSE
+                            WHERE codigo_producto = %s OR id_producto::text = %s
+                            """,
+                            (pid, pid)
+                        )
+                        affected = int(cur.rowcount or 0)
+                        conn.commit()
+                        cur.close()
+                        if affected <= 0:
+                            return jsonify({"success": False, "error": "Producto no encontrado"}), 404
+                        return jsonify({"success": True, "data": {"deleted": affected, "product_id": pid}})
+
+                    payload = request.get_json(silent=True) or {}
+                    sets = []
+                    params = []
+                    updated_fields = {}
+                    if 'name' in payload:
+                        _name = str(payload.get('name') or '').strip()
+                        sets.append('nombre_producto = %s')
+                        params.append(_name)
+                        updated_fields['name'] = _name
+                    if 'category' in payload:
+                        _cat = _normalize_multi_category_storage(payload.get('category'))
+                        sets.append('categoria = %s')
+                        params.append(_cat)
+                        updated_fields['category'] = _cat
+
+                    # 支持 code / product_code 两种前端字段名
+                    if 'code' in payload or 'product_code' in payload:
+                        _pc = str(payload.get('product_code', payload.get('code')) or '').strip()
+                        sets.append('codigo_producto = %s')
+                        params.append(_pc)
+                        updated_fields['product_code'] = _pc
+
+                    # 支持价格字段更新
+                    if 'price' in payload:
+                        try:
+                            _price = float(payload.get('price') or 0)
+                        except (TypeError, ValueError):
+                            cur.close()
+                            return jsonify({"success": False, "error": "price inválido"}), 400
+                        sets.append('precio_unidad = %s')
+                        params.append(_price)
+                        updated_fields['price'] = _price
+
+                    if 'wholesale_price' in payload:
+                        try:
+                            _w_price = float(payload.get('wholesale_price') or 0)
+                        except (TypeError, ValueError):
+                            cur.close()
+                            return jsonify({"success": False, "error": "wholesale_price inválido"}), 400
+                        sets.append('precio_mayor = %s')
+                        params.append(_w_price)
+                        updated_fields['wholesale_price'] = _w_price
+
+                    if 'bulk_price' in payload:
+                        try:
+                            _b_price = float(payload.get('bulk_price') or 0)
+                        except (TypeError, ValueError):
+                            cur.close()
+                            return jsonify({"success": False, "error": "bulk_price inválido"}), 400
+                        sets.append('precio_bulto = %s')
+                        params.append(_b_price)
+                        updated_fields['bulk_price'] = _b_price
+
+                    if not sets:
+                        cur.close()
+                        return jsonify({"success": False, "error": "No hay campos para actualizar"}), 400
+
+                    params.extend([pid, pid])
+                    sql = "UPDATE products SET " + ", ".join(sets) + " WHERE codigo_producto = %s OR id_producto::text = %s"
+                    cur.execute(sql, tuple(params))
+                    affected = int(cur.rowcount or 0)
+                    conn.commit()
+                    cur.close()
+
+                    if affected <= 0:
+                        return jsonify({"success": False, "error": "Producto no encontrado"}), 404
+                    return jsonify({
+                        "success": True,
+                        "data": {
+                            "updated": affected,
+                            "product_id": pid,
+                            "updated_field_names": list(updated_fields.keys()),
+                            "updated_fields": updated_fields,
+                            "message": f"Producto actualizado: {', '.join(updated_fields.keys())}"
+                        }
+                    })
+                finally:
+                    conn.close()
+            except Exception as e:
+                logger.error(f"❌ 管理端更新/删除产品失败: {e}")
+                return jsonify({"success": False, "error": str(e)}), 500
 
         @self.app.route('/api/debug-images')
         def debug_images():
@@ -2160,7 +2944,7 @@ class PWACartAPIServer:
         
         @self.app.route('/api/products', methods=['GET'])
         @_cached_api_response(
-            lambda r: f"products_{r.args.get('supplier') or ''}_{r.args.get('search') or ''}_{r.args.get('page',1)}_{r.args.get('limit',30)}",
+            _products_list_cache_key,
             _API_CACHE_TTL_PRODUCTS
         )
         def get_products():
@@ -2173,11 +2957,29 @@ class PWACartAPIServer:
             try:
                 if not self.db:
                     return jsonify({"error": "Base de datos no conectada"}), 500
+
+                def _dedupe_api_rows(rows):
+                    seen = set()
+                    out = []
+                    for p in (rows or []):
+                        code_key = str((p or {}).get('product_code') or '').strip().upper()
+                        code_key = re.sub(r'[\s_\-]+', '', code_key)
+                        code_key = re.sub(r'\._A[Ii]$', '', code_key)
+                        id_key = str((p or {}).get('id') or '').strip().upper()
+                        name_key = str((p or {}).get('name') or '').strip().upper()
+                        fallback_key = '|'.join([x for x in [name_key, str(float((p or {}).get('price') or 0)), str(float((p or {}).get('wholesale_price') or 0))] if x])
+                        k = code_key or id_key or fallback_key
+                        if not k or k in seen:
+                            continue
+                        seen.add(k)
+                        out.append(p)
+                    return out
                 
                 # 获取查询参数
                 supplier_lower = (supplier or '').strip().lower()  # 统一小写比较，避免 Others/others 等导致走错分支
-                page = int(request.args.get('page', 1))
-                limit = int(request.args.get('limit', 30))  # 默认返回30个产品
+                page, limit = _products_list_effective_page_limit(request)
+                # CHANGE: 强制“完全无过滤全量返回”模式（忽略 supplier/category/search/is_active/image 是否存在）。
+                force_unfiltered_mode = True
                 # CHANGE: 移除 supplier=others 早期返回空，让 PRODUCTOS 按「DB 为主 + 图片在 D:\Ya Subio 匹配」正常显示
                 # 获取所有产品（暂时註销 SQLite 时仅用 PostgreSQL）
                 if USE_SQLITE_FOR_PRODUCTS and self.db:
@@ -2202,10 +3004,81 @@ class PWACartAPIServer:
                 if len(all_filtered_products) > 0:
                     sample_providers = [pinfo.get('codigo_proveedor', 'NULL') for _, pinfo in all_filtered_products[:3]]
                     print(f"🔍 [API] 前3个产品的 codigo_proveedor: {sample_providers}")
-                
-                products_to_process = self._select_products_by_supplier(
-                    cristy_products, all_filtered_products, products, supplier_lower, search, OWN_SUPPLIER_CODE
-                )
+
+                # CHANGE: 分类筛选优先在后端执行，避免前端 search/category 叠加导致空结果
+                if category:
+                    products_to_process = []
+                    cat_query = str(category).strip().lower()
+                    for pid, pinfo in products.items():
+                        if not isinstance(pinfo, dict) or not pinfo.get('is_active', 1):
+                            continue
+                        # 多分类字段匹配
+                        if not _multi_category_contains(pinfo.get('category_id'), cat_query):
+                            continue
+                        # supplier 再筛
+                        if supplier_lower:
+                            cp = (pinfo.get('codigo_proveedor') or '').strip().lower()
+                            if supplier_lower == OWN_SUPPLIER_CODE.lower() and cp != OWN_SUPPLIER_CODE.lower():
+                                continue
+                            if supplier_lower == 'others' and cp == OWN_SUPPLIER_CODE.lower():
+                                continue
+                            if supplier_lower not in (OWN_SUPPLIER_CODE.lower(), 'others') and cp != supplier_lower:
+                                continue
+                        products_to_process.append((pid, pinfo))
+                    products_to_process.sort(key=lambda x: x[1].get('created_at', '') or '', reverse=True)
+                    logger.info(f"📦 [API] category={category} 后端筛选结果: {len(products_to_process)}")
+                    print(f"📦 [API] category={category} 后端筛选结果: {len(products_to_process)}")
+                else:
+                    products_to_process = self._select_products_by_supplier(
+                        cristy_products, all_filtered_products, products, supplier_lower, search, OWN_SUPPLIER_CODE
+                    )
+
+                # CHANGE: 完全无过滤全量返回（忽略 supplier/category/search/is_active/image）。
+                full_db_mode = False
+                if force_unfiltered_mode:
+                    full_db_mode = True
+                    # products 字典会同时放 id 键与 product_code 键，按对象身份去重。
+                    _seen_obj = set()
+                    products_to_process = []
+                    for pid, pinfo in products.items():
+                        if not isinstance(pinfo, dict):
+                            continue
+                        _oid = id(pinfo)
+                        if _oid in _seen_obj:
+                            continue
+                        _seen_obj.add(_oid)
+                        products_to_process.append((pid, pinfo))
+                    logger.info(f"📦 [API] 强制无过滤全量模式: 去重后 {len(products_to_process)} 条")
+                    print(f"📦 [API] 强制无过滤全量模式: 去重后 {len(products_to_process)} 条")
+
+                # CHANGE: 指定 supplier（非 Cristy/others）时，按数据库字段精确筛选，
+                # 不受 PRODUCTOS 白名单限制（例如 WONI_IMPORT_AND_EXPORT / importadoraWoni / IMP235）
+                if (not force_unfiltered_mode) and supplier_lower and supplier_lower not in (OWN_SUPPLIER_CODE.lower(), 'others'):
+                    def _norm_supplier_alias(v):
+                        s = str(v or '').strip().lower().replace('-', '').replace('_', '').replace(' ', '')
+                        if not s:
+                            return ''
+                        # CHANGE: importadoraWoni / WONI_IMPORT_AND_EXPORT / IMP235 视为同一供应商组，避免图2图3分裂
+                        if s in ('importadorawoni', 'woniimportandexport', 'imp235'):
+                            return 'woni-group'
+                        return s
+
+                    requested_supplier = _norm_supplier_alias(supplier_lower)
+                    direct_filtered = []
+                    for pid, pinfo in products.items():
+                        if not isinstance(pinfo, dict):
+                            continue
+                        if not pinfo.get('is_active', 1):
+                            continue
+                        cp = _norm_supplier_alias(pinfo.get('codigo_proveedor'))
+                        cu = _norm_supplier_alias(pinfo.get('channel_username'))
+                        sp = _norm_supplier_alias(pinfo.get('supplier'))
+                        if requested_supplier and requested_supplier in (cp, cu, sp):
+                            direct_filtered.append((pid, pinfo))
+                    direct_filtered.sort(key=lambda x: x[1].get('created_at', '') or '', reverse=True)
+                    products_to_process = direct_filtered
+                    logger.info(f"📦 [API] supplier={supplier} 别名归一筛选命中: {len(products_to_process)}")
+                    print(f"📦 [API] supplier={supplier} 别名归一筛选命中: {len(products_to_process)}")
                 
                 # CHANGE: 有搜索关键词时，强制使用 ULTIMO+PRODUCTOS 并集，实现跨两页搜索
                 # CHANGE: 按 product_code（规范化：去 ._AI 后缀、小写）去重，避免同一产品多供应商/多渠道重复
@@ -2215,7 +3088,7 @@ class PWACartAPIServer:
                     if not raw:
                         return raw
                     return re.sub(r'\._A[Ii]\s*$', '', raw, flags=re.IGNORECASE).strip().lower() or raw.lower()
-                if search and str(search).strip():
+                if (not force_unfiltered_mode) and search and str(search).strip():
                     # CHANGE: 搜索时包含所有产品（绕过日期过滤），确保按产品代码可搜到任意产品
                     seen_search = set()
                     combined_search = []
@@ -2360,9 +3233,9 @@ class PWACartAPIServer:
 
                 # CHANGE: supplier=Cristy 时以图为准：先遍历图片文件夹，用文件名解析 product_id，再查库填 name/price，保证一图一产品数据不错位
                 # CHANGE: 有 search 时强制走 filtered_with_meta 逻辑，确保搜索过滤生效
-                _skip_image_first = bool(search and str(search).strip())
+                _skip_image_first = bool((not force_unfiltered_mode) and search and str(search).strip())
                 print(f"📷 [API] Cristy 检查: _is_cristy_request={_is_cristy_request}, len(cristy_products)={len(cristy_products)}, len(_files_cristy)={len(_files_cristy)}, _cristy_subdir={_cristy_subdir!r}, _skip_image_first={_skip_image_first}")
-                if not _skip_image_first and _is_cristy_request and len(cristy_products) > 0 and len(_files_cristy) > 0:
+                if (not force_unfiltered_mode) and (not _skip_image_first) and _is_cristy_request and len(cristy_products) > 0 and len(_files_cristy) > 0:
                     _lookup = {}
                     for _pid, _pinfo in cristy_products:
                         _key = (str(_pid).strip().lower() if _pid else '').strip()
@@ -2429,17 +3302,19 @@ class PWACartAPIServer:
                             'bulk_price': _pinfo.get('bulk_price', 0),
                             'description': _pinfo.get('description', ''),
                             'image_path': _img_path,
-                            'category': _pinfo.get('category_id', 'default'),
+                            'category': _normalize_multi_category_storage(_pinfo.get('category_id', 'default')),
                             'created_at': _created,
                             'channel_username': _pinfo.get('channel_username', ''),
                             'codigo_proveedor': _pinfo.get('codigo_proveedor', '')
                         })
+                    paginated_products = _dedupe_api_rows(paginated_products)
                     for i, p in enumerate(paginated_products[:3]):
                         print(f"   [Cristy图为准] 产品[{i}] id={p.get('id')} name={p.get('name')[:40] if p.get('name') else ''} price={p.get('price')} image={p.get('image_path', '')[:60]}")
                     total_filtered = _total_cristy
                     resp = jsonify({
                         "success": True,
                         "data": paginated_products,
+                        "total": total_filtered,
                         "pagination": {
                             "page": page,
                             "limit": limit,
@@ -2454,7 +3329,7 @@ class PWACartAPIServer:
                 # CHANGE: PRODUCTOS(supplier=others) 按「产品图片名称」查找映射：用全库 products 的 ruta_imagen 建 文件名->产品
                 # 使用 _files_ya_subio_no_cristy（含 Ya Subio + product_images + output_images），使新上传产品图能显示
                 # CHANGE: 有 search 时跳过「以图为准」分支，强制走 filtered_with_meta 确保搜索过滤
-                if not _skip_image_first and supplier_lower == 'others' and len(_files_ya_subio_no_cristy) > 0:
+                if (not force_unfiltered_mode) and (not _skip_image_first) and supplier_lower == 'others' and len(_files_ya_subio_no_cristy) > 0:
                     # CHANGE: 合并 PostgreSQL 非Cristy 产品，避免仅存 PG 的产品（如 id_producto 1677/1678）无法映射
                     _pg_others = self._get_others_products_from_postgres()
                     for _pid, _pinfo in _pg_others:
@@ -2537,27 +3412,15 @@ class PWACartAPIServer:
                             'bulk_price': _pinfo.get('bulk_price', 0),
                             'description': _pinfo.get('description', ''),
                             'image_path': _img_path,
-                            'category': _pinfo.get('category_id', 'default'),
+                            'category': _normalize_multi_category_storage(_pinfo.get('category_id', 'default')),
                             'created_at': _created,
                             'channel_username': _pinfo.get('channel_username', ''),
                             'codigo_proveedor': _pinfo.get('codigo_proveedor', '')
                         })
+                    paginated_products = _dedupe_api_rows(paginated_products)
                     logger.info(f"📦 [API] PRODUCTOS 以图为准: 共 {_total_others} 个，本页 {len(paginated_products)} 个，DB图关联数={len(_image_to_product)}")
                     print(f"📦 [API] PRODUCTOS 以图为准: 共 {_total_others} 个，本页 {len(paginated_products)} 个，DB图关联数={len(_image_to_product)}")
-                    resp = jsonify({
-                        "success": True,
-                        "data": paginated_products,
-                        "pagination": {
-                            "page": page,
-                            "limit": limit,
-                            "total": _total_others,
-                            "total_pages": (_total_others + limit - 1) // limit if _total_others else 1
-                        }
-                    })
-                    resp.headers['Cache-Control'] = 'no-store, no-cache, must-revalidate'
-                    resp.headers['Pragma'] = 'no-cache'
-                    resp.headers['X-Image-Logic'] = 'productos-image-first'
-                    return resp
+                    return finalize_products_payload(_image_first_others, total_hint=_total_others, page_hint=page, limit_hint=limit)
                 else:
                     paginated_products = None  # 走下方原有逻辑
 
@@ -2588,95 +3451,146 @@ class PWACartAPIServer:
                     return None
 
                 def resolve_image_for_product(pid, img_path):
-                    """CHANGE: 只通过图片名字与 product_id 匹配才返回，通过图片名字进行匹配不可能出错。supplier=others 时用 _files_for_resolve（非Cristy图）"""
+                    """CHANGE: 严格模式，产品接口阶段只返回能在当前图片索引中确认存在的图片。"""
                     files = _files_for_resolve
-                    if not files:
+                    if not img_path:
                         return ''
-                    mid = None  # 仅按图片名匹配，不再用 message_id 等
-                    # 1) 有 DB 路径：先精确匹配文件名，再尝试「从文件名抽 message_id -> telegram_<id>.jpg」
-                    if img_path:
-                        if img_path.startswith('/api/images/'):
-                            fname = _normalize_image_filename(img_path.replace('/api/images/', '').split('?')[0].strip())
-                        else:
-                            fname = _normalize_image_filename(os.path.basename(img_path.replace('/', os.sep).replace('\\', os.sep).strip()))
-                        if fname:
-                            base_db = os.path.splitext(fname)[0]
-                            for f in files:
-                                base_f = os.path.splitext(f)[0]
-                                # 匹配：product_id 与文件名一致，或 product 的 image_path 文件名与 file 一致（PRODUCTOS 产品用）
-                                if f.lower() == fname.lower():
-                                    if _file_base_matches_product(base_f, pid):
-                                        return f'/api/images/{f}'
-                                    if base_f.lower() == base_db.lower():
-                                        return f'/api/images/{f}'
-                            for f in files:
-                                base_f = os.path.splitext(f)[0]
-                                if (base_f.lower() == base_db.lower() or _normalize_base_ai_al(base_f) == _normalize_base_ai_al(base_db)) and _file_base_matches_product(base_f, pid):
-                                    return f'/api/images/{f}'
-                            for f in files:
-                                base_f = os.path.splitext(f)[0]
-                                if base_f.lower() == base_db.lower():
-                                    return f'/api/images/{f}'
-                    # 2) 只通过图片名字与 product_id 匹配：遍历文件，仅当文件名与产品一致才返回（不可能错配）
-                    if not mid and img_path:
-                        fname = _normalize_image_filename(os.path.basename(img_path.replace('/', os.path.sep).replace('\\', os.sep).strip())) if img_path.startswith('/api/images/') else _normalize_image_filename(os.path.basename(img_path.replace('/', os.path.sep).replace('\\', os.sep).strip()))
-                        base_db = os.path.splitext(fname)[0] if fname else ''
-                        mid = _message_id_from_name(base_db)
-                    if mid:
-                        tg_name = 'telegram_' + mid
+
+                    # 1) 若已是云端 URL，直接返回
+                    if isinstance(img_path, str) and (img_path.startswith('http://') or img_path.startswith('https://')):
+                        return img_path
+
+                    # 2) 标准化为 /api/images/<filename>
+                    if img_path.startswith('/api/images/'):
+                        fname = _normalize_image_filename(img_path.replace('/api/images/', '').split('?')[0].strip())
+                    else:
+                        fname = _normalize_image_filename(os.path.basename(img_path.replace('/', os.sep).replace('\\', os.sep).strip()))
+
+                    if not fname:
+                        return ''
+
+                    # 3) 仅做「同文件名 / 同主名不同扩展」确认；找不到就当作无图，直接过滤掉
+                    if files:
+                        fname_lower = fname.lower()
                         for f in files:
-                            base_f = os.path.splitext(f)[0]
-                            if base_f.lower() == tg_name and _file_base_matches_product(base_f, pid):
+                            if f.lower() == fname_lower:
                                 return f'/api/images/{f}'
+
+                        req_base = os.path.splitext(fname)[0].lower()
                         for f in files:
-                            base_f = os.path.splitext(f)[0]
-                            if base_f.lower() == mid and _file_base_matches_product(base_f, pid):
+                            if os.path.splitext(f)[0].lower() == req_base:
                                 return f'/api/images/{f}'
-                        msg_prefix = 'msg_' + mid + '_'
-                        for f in files:
-                            base_f = os.path.splitext(f)[0]
-                            if base_f.lower().startswith(msg_prefix) and _file_base_matches_product(base_f, pid):
-                                return f'/api/images/{f}'
-                    # 3) D:\Ya Subio 内多为 importadoraWoni_115_no_white.jpg：用「数字段」匹配（文件名分段含该数字），优先前缀一致
-                    base_db = ''
-                    if img_path:
-                        fname = _normalize_image_filename(img_path.replace('/api/images/', '').split('?')[0].strip()) if img_path.startswith('/api/images/') else _normalize_image_filename(os.path.basename(img_path.replace('/', os.path.sep).replace('\\', os.sep).strip()))
-                        base_db = os.path.splitext(fname)[0] if fname else ''
-                    if not base_db and pid:
-                        base_db = str(pid).strip()
-                    num_to_try = mid
-                    if not num_to_try and base_db:
-                        parts_db = re.split(r'[_\-.\s]+', base_db.lower())
-                        for p in reversed(parts_db):
-                            if p.isdigit() and len(p) >= 2:
-                                num_to_try = p
-                                break
-                    if num_to_try:
-                        candidates = [f for f in files if num_to_try in re.split(r'[_\-.\s]+', os.path.splitext(f)[0].lower())]
-                        if candidates:
-                            if base_db:
-                                for f in candidates:
-                                    base_f = os.path.splitext(f)[0]
-                                    if (base_db.lower() in base_f.lower() or base_f.lower() in base_db.lower() or _normalize_base_ai_al(base_f) == _normalize_base_ai_al(base_db)) and _file_base_matches_product(base_f, pid):
-                                        return f'/api/images/{f}'
-                            for f in candidates:
-                                base_f = os.path.splitext(f)[0]
-                                if _file_base_matches_product(base_f, pid):
-                                    return f'/api/images/{f}'
-                    # 仅当图片文件名与 product_id 一致才返回（通过图片名字匹配不可能出错）
-                    for f in files:
-                        base_f = os.path.splitext(f)[0]
-                        if _file_base_matches_product(base_f, pid):
-                            return f'/api/images/{f}'
+
                     return ''
+
+                def finalize_products_payload(rows, total_hint=None, page_hint=None, limit_hint=None):
+                    """统一收口：只保留 Ya Subio 文件夹内确实存在的图片，重算 total 与分页。"""
+                    def _is_strict_yasubio_image(path_value):
+                        if not path_value:
+                            return False
+                        if not isinstance(path_value, str):
+                            path_value = str(path_value)
+                        if path_value.startswith('http://') or path_value.startswith('https://'):
+                            return False
+                        img_name = ''
+                        if '/api/images/' in path_value:
+                            img_name = path_value.replace('/api/images/', '').split('?')[0].strip()
+                        else:
+                            try:
+                                img_name = os.path.basename(path_value.replace('/', os.sep).replace('\\', os.sep).strip())
+                            except Exception:
+                                img_name = ''
+                        if not img_name:
+                            return False
+                        strict_files = [_normalize_image_filename(f).lower() for f in (_files_ya_subio_only or []) if f]
+                        img_norm = _normalize_image_filename(img_name).lower()
+                        if img_norm in strict_files:
+                            return True
+                        base_norm = os.path.splitext(img_norm)[0]
+                        return any(os.path.splitext(f)[0].lower() == base_norm for f in strict_files)
+
+                    filtered_rows = []
+                    seen = set()
+                    for row in (rows or []):
+                        if not isinstance(row, tuple) or len(row) < 4:
+                            continue
+                        pid, pinfo, created_at, image_path = row[0], row[1], row[2], row[3]
+                        if not isinstance(pinfo, dict):
+                            continue
+                        key = str(pinfo.get('product_code') or pinfo.get('codigo_producto') or pid or '').strip().lower()
+                        if not key:
+                            key = str(pid or '').strip().lower()
+                        if key and key in seen:
+                            continue
+                        if key:
+                            seen.add(key)
+                        if not _is_strict_yasubio_image(image_path):
+                            continue
+                        strict_img = image_path
+                        if isinstance(strict_img, str) and '/api/images/' in strict_img:
+                            strict_img = '/api/images/' + _normalize_image_filename(strict_img.replace('/api/images/', '').split('?')[0].strip())
+                        filtered_rows.append((pid, pinfo, created_at, strict_img))
+                    total_final = len(filtered_rows)
+                    page_final = int(page_hint or 1)
+                    limit_final = int(limit_hint or len(filtered_rows) or 1)
+                    total_pages = (len(filtered_rows) + limit_final - 1) // limit_final if filtered_rows else 1
+                    start = max(0, (page_final - 1) * limit_final)
+                    end = start + limit_final
+                    page_rows = filtered_rows[start:end]
+                    product_list = []
+                    for product_id, product_info, created_at, image_path in page_rows:
+                        _img_basename = ''
+                        if image_path and ('/api/images/' in image_path or image_path.startswith('/api/images/')):
+                            _img_basename = (image_path.replace('/api/images/', '').split('?')[0].strip() or '')
+                        _display_code = (product_info.get('product_code') or product_info.get('codigo_producto') or product_info.get('id') or product_id)
+                        if hasattr(_display_code, 'strip'):
+                            _display_code = (_display_code or '').strip()
+                        else:
+                            _display_code = str(_display_code or '').strip()
+                        if not _display_code and _img_basename:
+                            _display_code = os.path.splitext(_img_basename)[0].strip() or str(product_id)
+                        _db_name = (product_info.get('name', '') or product_info.get('nombre_producto', '') or '').strip()
+                        _display_name = _db_name if _db_name else (_display_code or str(product_id))
+                        _pu = float(product_info.get('price') or 0)
+                        product_list.append({
+                            'id': product_id,
+                            'product_code': _display_code or str(product_id),
+                            'name': _display_name,
+                            'price': _pu,
+                            'wholesale_price': product_info.get('wholesale_price', 0),
+                            'bulk_price': product_info.get('bulk_price', 0),
+                            'description': product_info.get('description', ''),
+                            'image_path': image_path,
+                            'category': _normalize_multi_category_storage(product_info.get('category_id', 'default')),
+                            'created_at': created_at,
+                            'channel_username': product_info.get('channel_username', ''),
+                            'codigo_proveedor': product_info.get('codigo_proveedor', '')
+                        })
+                    product_list = _dedupe_api_rows(product_list)
+                    resp = jsonify({
+                        "success": True,
+                        "data": product_list,
+                        "total": len(product_list),
+                        "pagination": {
+                            "page": page_final,
+                            "limit": limit_final,
+                            "total": len(product_list),
+                            "total_pages": total_pages
+                        }
+                    })
+                    resp.headers['Cache-Control'] = 'no-store, no-cache, must-revalidate'
+                    resp.headers['Pragma'] = 'no-cache'
+                    resp.headers['X-Image-Logic'] = 'finalized-products-payload'
+                    return resp
                 
                 # CHANGE: 方案 A - 只显示「在 D:\Ya Subio 有图」的产品；要显示更多产品就把更多已处理图放入 D:\Ya Subio（且文件名能被现有匹配规则识别）
                 filtered_with_meta = []
                 for product_id, product_info in products_to_process:
-                    if category and product_info.get('category_id') != category:
+                    # category 已在上游优先后端筛过，这里仅作防御性保留
+                    if (not force_unfiltered_mode) and category and not _multi_category_contains(product_info.get('category_id'), category):
                         continue
                     # CHANGE: 只搜索 nombre_producto、descripcion、product_code，大小写不敏感，模糊匹配收紧
-                    if search:
+                    if (not force_unfiltered_mode) and search:
                         q_raw = str(search).strip().lower()
                         keywords = [k.strip() for k in q_raw.split() if k.strip()]
                         if not keywords:
@@ -2746,40 +3660,37 @@ class PWACartAPIServer:
                         image_path = f'/api/images/{filename}'
                     elif image_path and not image_path.startswith('http'):
                         image_path = f'/api/images/{_normalize_image_filename(image_path)}'
-                    resolved = resolve_image_for_product(product_id, image_path)
-                    if not resolved and image_path and (image_path.startswith('/api/images/') or image_path.startswith('http')):
-                        # CHANGE: 搜索时若 resolve 失败但已有有效路径（云端图或 /api/images/），仍保留产品，避免按代码搜索无结果
-                        resolved = image_path if image_path.startswith('http') else image_path
-                    # CHANGE: 云端 Render 无本地图片目录时，以 DB 为主：用 PAGES_IMAGE_BASE_URL 构造图片 URL，避免产品被过滤
-                    if not resolved and not _files_for_resolve:
-                        pages_base = getattr(self, 'pages_image_base_url', None) or (os.getenv('PAGES_IMAGE_BASE_URL', '') or '').strip().rstrip('/')
-                        if pages_base:
-                            _img = product_info.get('ruta_imagen_raw') or product_info.get('image_path') or product_info.get('ruta_imagen') or image_path or ''
-                            if _img and isinstance(_img, str):
-                                _norm = _img.replace('\\', '/').strip()
-                                if _img.startswith('/api/images/'):
-                                    _rel = _normalize_image_filename(_img.replace('/api/images/', '').split('?')[0].strip())
-                                elif 'output_images' in _norm.lower() or 'product_images' in _norm.lower():
-                                    # 保留相对路径，如 .../output_images/Importadora_Chinito/xxx.jpg -> Importadora_Chinito/xxx.jpg
-                                    _lower = _norm.lower()
-                                    for _key in ('output_images/', 'product_images/'):
-                                        if _key in _lower:
-                                            _rel = _norm[_lower.index(_key) + len(_key):].replace(' ', '%20')
-                                            _rel = _normalize_image_filename(_rel)
-                                            break
-                                    else:
-                                        _rel = _normalize_image_filename(os.path.basename(_norm))
+                    pages_base = getattr(self, 'pages_image_base_url', None) or (os.getenv('PAGES_IMAGE_BASE_URL', '') or '').strip().rstrip('/')
+                    if pages_base:
+                        _img = product_info.get('ruta_imagen_raw') or product_info.get('image_path') or product_info.get('ruta_imagen') or image_path or ''
+                        if _img and isinstance(_img, str):
+                            _norm = _img.replace('\\', '/').strip()
+                            if _img.startswith('/api/images/'):
+                                _rel = _normalize_image_filename(_img.replace('/api/images/', '').split('?')[0].strip())
+                            elif 'output_images' in _norm.lower() or 'product_images' in _norm.lower():
+                                # 保留相对路径，如 .../output_images/Importadora_Chinito/xxx.jpg -> Importadora_Chinito/xxx.jpg
+                                _lower = _norm.lower()
+                                for _key in ('output_images/', 'product_images/'):
+                                    if _key in _lower:
+                                        _rel = _norm[_lower.index(_key) + len(_key):].replace(' ', '%20')
+                                        _rel = _normalize_image_filename(_rel)
+                                        break
                                 else:
                                     _rel = _normalize_image_filename(os.path.basename(_norm))
-                                if _rel and _rel.lower().endswith(('.jpg', '.jpeg', '.png', '.gif', '.webp')):
-                                    _sub = 'Cristy/' if (product_info.get('codigo_proveedor') or '').strip().lower() == 'cristy' else ''
-                                    resolved = pages_base + '/Ya%20Subio/' + _sub + _rel
-                    # CHANGE: 云端无本地图时，即使 resolve 失败也保留产品（传 image_path 或空），前端会显示 Sin imagen，避免 180 产品只显示 4 个
-                    if not resolved and not _files_for_resolve and image_path:
-                        resolved = image_path  # 保留 /api/images/xxx 供前端尝试加载
-                    if not resolved:
-                        continue  # 图片不在 D:\Ya Subio 内，不显示该产品
-                    filtered_with_image.append((product_id, product_info, created_at, resolved))
+                            else:
+                                _rel = _normalize_image_filename(os.path.basename(_norm))
+                            if _rel and _rel.lower().endswith(('.jpg', '.jpeg', '.png', '.gif', '.webp')):
+                                _sub = 'Cristy/' if (product_info.get('codigo_proveedor') or '').strip().lower() == 'cristy' else ''
+                                resolved_pages = pages_base + '/Ya%20Subio/' + _sub + _rel
+                                filtered_with_image.append((product_id, product_info, created_at, resolved_pages))
+                                continue
+                    resolved = resolve_image_for_product(product_id, image_path)
+                    # CHANGE: 全量模式下不过滤图片存在性，确保前台返回全部 DB 记录。
+                    # 非全量模式保持原逻辑（必须在 Ya Subio 找到图才返回）。
+                    if not resolved and not full_db_mode:
+                        continue  # 图片不在 D:\Ya Subio 内（含子目录），不显示该产品
+                    final_image = resolved or image_path or ''
+                    filtered_with_image.append((product_id, product_info, created_at, final_image))
                 filtered_with_image.sort(key=lambda x: x[2], reverse=True)
                 total_filtered = len(filtered_with_image)
                 start = (page - 1) * limit
@@ -2815,14 +3726,14 @@ class PWACartAPIServer:
                         'bulk_price': product_info.get('bulk_price', 0),
                         'description': product_info.get('description', ''),
                         'image_path': image_path,
-                        'category': product_info.get('category_id', 'default'),
+                        'category': _normalize_multi_category_storage(product_info.get('category_id', 'default')),
                         'created_at': created_at,
                         'channel_username': product_info.get('channel_username', ''),
                         'codigo_proveedor': product_info.get('codigo_proveedor', '')
                     })
                 
                 # product_list 已是当前页，total 用 total_filtered
-                paginated_products = product_list
+                paginated_products = _dedupe_api_rows(product_list)
                 # CHANGE: 调试图片不显示 - 打印前几条的 image_path
                 with_img = sum(1 for p in paginated_products if p.get('image_path'))
                 logger.info(f"📦 [API] 本页有图产品数: {with_img}/{len(paginated_products)}")
@@ -2839,24 +3750,7 @@ class PWACartAPIServer:
                     logger.info(f"🔍 [API] 搜索无结果: 关键词={search!r}, 扫描产品={len(products_to_process)}, 文本匹配={len(filtered_with_meta)}, 有图产品=0")
                     print(f"🔍 [API] 搜索无结果: 关键词={search!r}, 扫描产品={len(products_to_process)}, 文本匹配={len(filtered_with_meta)}, 有图产品=0")
                 
-                resp = jsonify({
-                    "success": True,
-                    "data": paginated_products,
-                    "pagination": {
-                        "page": page,
-                        "limit": limit,
-                        "total": total_filtered,
-                        "total_pages": (total_filtered + limit - 1) // limit if total_filtered else 1
-                    }
-                })
-                # NOTE: 同步后刷新网页需拿到最新产品列表，禁止缓存
-                resp.headers['Cache-Control'] = 'no-store, no-cache, must-revalidate'
-                resp.headers['Pragma'] = 'no-cache'
-                # CHANGE: 方案 A - 仅显示图片在 D:\Ya Subio 内存在的产品
-                resp.headers['X-Image-Logic'] = 'only-products-with-image-in-dir'
-                resp.headers['X-Image-Match-Count'] = str(sum(1 for p in paginated_products if p.get('image_path')))
-                resp.headers['X-Image-File-Count'] = str(len(_files_ya_subio))
-                return resp
+                return finalize_products_payload(filtered_with_image, total_hint=total_filtered, page_hint=page, limit_hint=limit)
                 
             except Exception as e:
                 logger.error(f"❌ 获取产品列表失败: {e}")
@@ -2966,6 +3860,28 @@ class PWACartAPIServer:
                         image_path = f'/api/images/{filename}'
                     elif image_path and not image_path.startswith('http'):
                         image_path = f'/api/images/{_normalize_image_filename(image_path)}'
+                # CHANGE: 若配置 PAGES_IMAGE_BASE_URL，则按 DB 路径直接拼 Pages 图片 URL（避免 Telegram 直达缺图）
+                pages_base = getattr(self, 'pages_image_base_url', None) or (os.getenv('PAGES_IMAGE_BASE_URL', '') or '').strip().rstrip('/')
+                if pages_base and not (image_path and (image_path.startswith('http://') or image_path.startswith('https://'))):
+                    _img = (product.get('ruta_imagen_raw') or product.get('ruta_imagen') or product.get('image_path') or image_path or '')
+                    if _img and isinstance(_img, str):
+                        _norm = _img.replace('\\', '/').strip()
+                        if _img.startswith('/api/images/'):
+                            _rel = _normalize_image_filename(_img.replace('/api/images/', '').split('?')[0].strip())
+                        elif 'output_images' in _norm.lower() or 'product_images' in _norm.lower():
+                            _lower = _norm.lower()
+                            for _key in ('output_images/', 'product_images/'):
+                                if _key in _lower:
+                                    _rel = _norm[_lower.index(_key) + len(_key):].replace(' ', '%20')
+                                    _rel = _normalize_image_filename(_rel)
+                                    break
+                            else:
+                                _rel = _normalize_image_filename(os.path.basename(_norm))
+                        else:
+                            _rel = _normalize_image_filename(os.path.basename(_norm))
+                        if _rel and _rel.lower().endswith(('.jpg', '.jpeg', '.png', '.gif', '.webp')):
+                            _sub = 'Cristy/' if (product.get('codigo_proveedor') or '').strip().lower() == 'cristy' else ''
+                            image_path = pages_base + '/Ya%20Subio/' + _sub + _rel
                 # CHANGE: 与列表一致，单一逻辑「根据图片名称查找」+ product_id；已是 http(s) 时不走本地目录
                 _ya = PWA_YA_SUBIO_BASE
                 if not (image_path and (image_path.startswith('http://') or image_path.startswith('https://'))) and os.path.isdir(_ya):
@@ -3043,7 +3959,7 @@ class PWACartAPIServer:
                         'bulk_price': product.get('bulk_price', 0),
                         'description': product.get('description', ''),
                         'image_path': image_path,
-                        'category': product.get('category_id', 'default'),
+                        'category': _normalize_multi_category_storage(product.get('category_id', 'default')),
                         'product_code': product.get('product_code', ''),
                         'codigo_proveedor': (product.get('codigo_proveedor') or '').strip()
                     }
@@ -3714,10 +4630,17 @@ class PWACartAPIServer:
         
         @self.app.route('/api/orders', methods=['GET'])
         def get_orders():
-            """获取订单列表。仅信任JWT。"""
+            """获取订单列表。优先JWT；管理端可用 X-Admin-Token 查看（体检/运维）。"""
             try:
                 user_id = getattr(request, 'user_id', None) if hasattr(request, 'user_id') else None
                 if user_id is None or user_id == 0:
+                    # CHANGE: 兼容管理端健康检查：允许携带 admin token 查询全部订单摘要
+                    ok, _ = _require_admin_token_for_request()
+                    if ok:
+                        if not self.db:
+                            return jsonify({"error": "Base de datos no conectada"}), 500
+                        all_orders = self.db.get_orders_for_sync() if hasattr(self.db, 'get_orders_for_sync') else []
+                        return jsonify({"success": True, "data": all_orders, "mode": "admin"})
                     return jsonify({"error": "Recargue la página e intente de nuevo"}), 400
                 
                 if not self.db:
@@ -3751,12 +4674,18 @@ class PWACartAPIServer:
                     return jsonify({"error": "Base de datos no conectada"}), 500
                 
                 order_detail = self.db.get_order_detail(order_id, user_id)
-                
+
+                # CHANGE: 某些历史数据里 user_id 可能有格式差异（如字符串/前导0），
+                # 列表能查到但详情按 user_id 精确匹配会 404；这里做一次仅按 order_id 的回退查询
+                if not order_detail and user_id is not None:
+                    logger.warning(f"⚠️ 订单详情按 user_id 未命中，回退仅按 order_id 查询: order_id={order_id}, user_id={user_id}")
+                    order_detail = self.db.get_order_detail(order_id, None)
+
                 if not order_detail:
                     return jsonify({"error": "El pedido no existe o no tiene permiso para acceder"}), 404
-                
+
                 logger.info(f"📋 获取订单详情: order_id={order_id}, user_id={user_id}")
-                
+
                 return jsonify({
                     "success": True,
                     "data": order_detail
